@@ -17,6 +17,8 @@ option(BINARY_NET "Enable BitNet / binary quantisation" OFF)
 option(BF16 "Enable brain‑float16 float matmul path" OFF)
 option(FP16 "Enable IEEE float16 matmul path" OFF)
 option(MXFP8 "Enable MXFP8 (forces compile‑time error – not on AVX2)" OFF)
+option(DEBUG_BREADCRUMBS "Enable breadcrumb tracing to stderr" OFF)
+option(SHERLOCK_LITE "Enable sherlock‑lite trace to stdout" OFF)
 
 # ------------------------------------------------------------------
 # Derive a single QUANT_TYPE macro from the enabled flag.
@@ -69,6 +71,12 @@ endif()
 if(MXFP8)
     add_compile_options(-DMXFP8)
 endif()
+if(DEBUG_BREADCRUMBS)
+    add_compile_options(-DDEBUG_BREADCRUMBS)
+endif()
+if(SHERLOCK_LITE)
+    add_compile_options(-DSHERLOCK_LITE)
+endif()
 
 # Add the derived QUANT_TYPE macro last (overrides any previous)
 add_compile_options(${QUANT_TYPE})
@@ -76,7 +84,39 @@ add_compile_options(${QUANT_TYPE})
 # ------------------------------------------------------------------
 # Source files – the core kernel plus a minimal main
 # ------------------------------------------------------------------
-add_executable(minimal_engine src/q4_matmul.c src/main.c)
+add_executable(nita
+    src/main.c
+    src/util.c
+    src/gguf.c
+    src/json.c
+    src/tokenizer.c
+    src/chat.c
+    src/http.c
+    src/dequant.c
+    src/transformer.c
+    src/q4_matmul.c
+)
+
+# libm for expf/cosf/powf/sqrtf.
+if(NOT MSVC)
+    target_link_libraries(nita PRIVATE m)
+endif()
+
+# Winsock is required by the HTTP server on Windows.
+if(WIN32)
+    target_link_libraries(nita PRIVATE ws2_32)
+endif()
+
+# Keep the historical binary name working for existing scripts.
+if(WIN32)
+    add_custom_command(TARGET nita POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:nita> $<TARGET_FILE_DIR:nita>/minimal_engine.exe)
+else()
+    add_custom_command(TARGET nita POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:nita> $<TARGET_FILE_DIR:nita>/minimal_engine)
+endif()
 
 message(STATUS "Project: NITA (NC Inference Tool for All)")
 message(STATUS "Engine flags:")
