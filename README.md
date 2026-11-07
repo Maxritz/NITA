@@ -275,7 +275,7 @@ so a test picks up the same sources and flags as the engine.
 | `hadamard` | `hadamard_test` | no |
 | `q35_heads` | `q35_heads_test` | no |
 | `q35_probe` | `q35_probe` | yes |
-| — | `quant_dot_test` | yes, plus a type id: `<model.gguf> <type-id> [rows]` |
+| `quant_dot` | `quant_dot_test` | yes |
 
 The two that read a GGUF register only when one is named:
 
@@ -283,9 +283,13 @@ The two that read a GGUF register only when one is named:
 cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf
 ```
 
-`quant_dot_test` stays a plain target because it also takes a tensor type: it
-compares one type's kernel against the float reference over the tensors a
-checkpoint actually stores, as `build/quant_dot_test <model.gguf> <type-id>`.
+`quant_dot` does not take a type id from the caller: `--all` reads the file's
+tensor table and runs every quantised type it finds, so the test cannot quietly
+check nothing after a checkpoint changes. Types with no integer kernel (the F32
+norm and bias tensors) are reported and skipped. Naming a type by hand still
+works for a single sweep: `build/quant_dot_test <model.gguf> <type-id> [rows]`.
+On the two Bonsai checkpoints it covers 151 `PTQ1_0` tensors and 498 `Q1_0`
+tensors respectively, with no tensor over the 1e-2 tolerance.
 
 ## Run
 

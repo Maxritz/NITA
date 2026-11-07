@@ -142,7 +142,7 @@ endif()
 #
 #   cmake --build build && ctest --test-dir build
 #
-# hadamard and q35_heads need no checkpoint, so they always register. The two
+# hadamard and q35_heads need no checkpoint, so they always register. The ones
 # that read a model file are built unconditionally and registered only when one
 # is supplied with -DNITA_TEST_MODEL=<path>. tests/kernel_test.c and
 # tests/model_test.c are left out: neither has a main(), and the first includes
@@ -167,7 +167,10 @@ add_executable(quant_dot_test tests/quant_dot_test.c)
 target_link_libraries(quant_dot_test PRIVATE nita_core)
 
 if(NITA_TEST_MODEL)
-    add_test(NAME q35_probe COMMAND q35_probe ${NITA_TEST_MODEL})
+    add_test(NAME q35_probe  COMMAND q35_probe  ${NITA_TEST_MODEL})
+    # --all walks the tensor table and tests every quantised type the file
+    # stores, so this entry does not have to name a type id that could drift.
+    add_test(NAME quant_dot  COMMAND quant_dot_test --all ${NITA_TEST_MODEL})
 endif()
 
 message(STATUS "Project: NITA (NC Inference Tool for All)")

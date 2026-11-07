@@ -186,30 +186,20 @@ static int run_bench(const char *path, int iters)
     return 0;
 }
 
-int main(int argc, char **argv)
+typedef struct {
+    int    tested;
+    int    failed;
+    double worst;
+} type_result_t;
+
+/* Compare every tensor of one type against the float reference. One line per
+ * tensor when `per_tensor` is set, a single summary line otherwise. */
+static int run_type(const gguf_file_t *g, uint32_t type, int max_rows,
+                    int per_tensor, type_result_t *res)
 {
-    gguf_file_t *g;
-    char         err[256];
-    uint32_t     type;
-    int          max_rows = 32, tested = 0, failed = 0;
-    uint64_t     ti;
+    uint64_t ti;
 
-    if (argc >= 3 && strcmp(argv[1], "--raw") == 0)
-        return run_blob(argv[2]);
-
-    if (argc >= 3 && strcmp(argv[1], "--bench") == 0)
-        return run_bench(argv[2], argc > 3 ? atoi(argv[3]) : 2000);
-
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <file.gguf> <type-id> [rows]\n"
-                        "       %s --raw <blob>\n", argv[0], argv[0]);
-        return 2;
-    }
-    type = (uint32_t)strtoul(argv[2], NULL, 10);
-    if (argc > 3) max_rows = atoi(argv[3]);
-
-    g = gguf_load(argv[1], err, sizeof err);
-    if (!g) { fprintf(stderr, "load failed: %s\n", err); return 2; }
+    memset(res, 0, sizeof *res);
 
     for (ti = 0; ti < g->tensor_count; ++ti) {
         const gguf_tensor_t *t = &g->tensors[ti];
@@ -229,7 +219,7 @@ int main(int argc, char **argv)
         row = (float *)malloc(k * sizeof(float));
         x   = (float *)malloc(k * sizeof(float));
         aq  = (nita_aq8_t *)malloc((size_t)nb * sizeof *aq);
-        if (!row || !x || !aq) return 2;
+        if (!row || !x || !aq) { free(row); free(x); free(aq); return 2; }
 
         for (r = 0; r < k; ++r) x[r] = frand();
         nita_aq8_quantise(x, (int)k, aq);
@@ -243,15 +233,107 @@ int main(int argc, char **argv)
             if (rel > worst) worst = rel;
             if (ae > worst_abs) worst_abs = ae;
         }
-        printf("  %-40s rows=%-5llu k=%-6llu  rel err %8.3e  abs %8.4f\n",
-               t->name, (unsigned long long)nrows, (unsigned long long)k,
-               worst, worst_abs);
-        ++tested;
-        if (worst > 1e-2) ++failed;
+        if (per_tensor)
+            printf("  %-40s rows=%-5llu k=%-6llu  rel err %8.3e  abs %8.4f\n",
+                   t->name, (unsigned long long)nrows, (unsigned long long)k,
+                   worst, worst_abs);
+        ++res->tested;
+        if (worst > 1e-2) ++res->failed;
+        if (worst > res->worst) res->worst = worst;
         free(row); free(x); free(aq);
     }
+    return 0;
+}
 
-    printf("%d tensor(s) of this type, %d over the 1e-2 tolerance\n", tested, failed);
-    gguf_free(g);
-    return failed ? 1 : 0;
+int main(int argc, char **argv)
+{
+    gguf_file_t *g;
+    char         err[256];
+    int          max_rows = 32;
+
+    if (argc >= 3 && strcmp(argv[1], "--raw") == 0)
+        return run_blob(argv[2]);
+
+    if (argc >= 3 && strcmp(argv[1], "--bench") == 0)
+        return run_bench(argv[2], argc > 3 ? atoi(argv[3]) : 2000);
+
+    if (argc >= 3 && strcmp(argv[1], "--all") == 0) {
+        /* Discover the types the checkpoint actually stores. Naming one by hand
+         * tests nothing at all if the checkpoint uses a different type, and a
+         * newly added type would go unnoticed; asking the file cannot drift. */
+        uint32_t types[64];
+        int      n_types = 0, total = 0, failed = 0;
+        uint64_t ti;
+        int      i;
+
+        if (argc > 3) max_rows = atoi(argv[3]);
+        g = gguf_load(argv[2], err, sizeof err);
+        if (!g) { fprintf(stderr, "load failed: %s\n", err); return 2; }
+
+        for (ti = 0; ti < g->tensor_count; ++ti) {
+            const gguf_tensor_t *t = &g->tensors[ti];
+            int                  seen = 0;
+
+            if (t->n_dims < 2) continue;
+            if (t->dims[0] % 32 != 0) continue;
+            if (nita_row_bytes(t->type, t->dims[0]) == 0) continue;
+            for (i = 0; i < n_types; ++i) if (types[i] == t->type) seen = 1;
+            if (seen) continue;
+            if (n_types == (int)(sizeof types / sizeof types[0])) {
+                fprintf(stderr, "more than %d tensor types; raise the array\n", n_types);
+                gguf_free(g);
+                return 2;
+            }
+            types[n_types++] = t->type;
+        }
+
+        for (i = 0; i < n_types; ++i) {
+            type_result_t res;
+
+            /* Norm weights, biases and the like are plain floats. There is no
+             * integer kernel to compare against there - the point of this test
+             * is the quantised path - so they are reported and skipped rather
+             * than counted as failures. */
+            if (!nita_quant_has_int_dot(types[i])) {
+                printf("type %-3u %-7s  no integer kernel, skipped\n",
+                       types[i], ggml_type_name(types[i]));
+                continue;
+            }
+            if (run_type(g, types[i], max_rows, 0, &res) != 0) { gguf_free(g); return 2; }
+            printf("type %-3u %-7s %5d tensor(s), %d over the 1e-2 tolerance,"
+                   " worst rel err %.3e\n",
+                   types[i], ggml_type_name(types[i]), res.tested, res.failed, res.worst);
+            total  += res.tested;
+            failed += res.failed;
+        }
+
+        printf("%d type(s), %d tensor(s), %d over tolerance\n", n_types, total, failed);
+        gguf_free(g);
+        return failed ? 1 : 0;
+    }
+
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <file.gguf> <type-id> [rows]\n"
+                        "       %s --all <file.gguf> [rows]   every type in the file\n"
+                        "       %s --raw <blob>\n"
+                        "       %s --bench <blob> [iters]\n",
+                argv[0], argv[0], argv[0], argv[0]);
+        return 2;
+    }
+
+    {
+        type_result_t res;
+
+        if (argc > 3) max_rows = atoi(argv[3]);
+        g = gguf_load(argv[1], err, sizeof err);
+        if (!g) { fprintf(stderr, "load failed: %s\n", err); return 2; }
+        if (run_type(g, (uint32_t)strtoul(argv[2], NULL, 10), max_rows, 1, &res) != 0) {
+            gguf_free(g);
+            return 2;
+        }
+        printf("%d tensor(s) of this type, %d over the 1e-2 tolerance\n",
+               res.tested, res.failed);
+        gguf_free(g);
+        return res.failed ? 1 : 0;
+    }
 }
