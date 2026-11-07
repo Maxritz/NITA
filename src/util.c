@@ -170,3 +170,16 @@ const char *nita_human_bytes(uint64_t bytes)
         snprintf(buf, sizeof buf, "%.2f %s", v, unit[u]);
     return buf;
 }
+
+uint64_t nita_fnv1a64(const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t       h = 0xcbf29ce484222325ULL;
+    size_t         i;
+
+    for (i = 0; i < n; ++i) {
+        h ^= (uint64_t)b[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}

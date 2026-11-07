@@ -85,6 +85,9 @@ char  *nita_strdup(const char *s);
 const char *nita_basename(const char *path);
 /* Format a byte count into a human readable string (static buffer). */
 const char *nita_human_bytes(uint64_t bytes);
+/* 64-bit FNV-1a over n bytes: short, stable, and cheap enough to hash a slice of
+ * every tensor, which is what the tensor and model checks compare. */
+uint64_t nita_fnv1a64(const void *p, size_t n);
 
 /* ================================================================== */
 /* GGUF                                                                */
@@ -319,12 +322,17 @@ int    nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *
 /* Transformer                                                         */
 /* ================================================================== */
 
+#define NITA_TENSOR_CHECK_BYTES 64
+
 typedef struct {
     const uint8_t *data;
     uint32_t       type;
     uint64_t       ne0;      /* input width  */
     uint64_t       ne1;      /* output height */
     bool           bound;
+    /* The GGUF tensor this was bound from, so a report can say which weight a
+     * field holds instead of only where its pointer landed. */
+    char           name[64];
 } nita_tensor_t;
 
 /* Bind every tensor in the file through the path the forward pass uses, in file
@@ -336,6 +344,11 @@ int nita_bind_all(const gguf_file_t *g, nita_tensor_t *out, size_t cap);
 /* Build the engine from a parsed GGUF file. Returns NULL and fills err when
  * the file is not a supported llama-style transformer. */
 nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t errlen);
+/* Print one line per distinct weight the model holds - role, the tensor it was
+ * bound from, the absolute file offset of its pointer and a hash of the first
+ * NITA_TENSOR_CHECK_BYTES there - plus the layer and line counts. Returns the
+ * number of lines, or -1 if there is nothing to report. */
+int nita_model_tensor_report(const nita_model_t *m, const gguf_file_t *g);
 void          nita_model_close(nita_model_t *m);
 /* Drop the KV cache so a new conversation starts at position 0. */
 void          nita_model_reset(nita_model_t *m);

@@ -295,6 +295,11 @@ structural cover it gets. Note that `quant_dot` compares each integer kernel
 against the row *this engine* dequantised, so it catches a kernel error but not
 a mis-read offset, which moves both sides together - that is the probe's job.
 
+`model_bind@<stem>` takes the same idea one level up, to the weights the loaded
+model holds (0.6 s on the 2B, 1.3 s on the 27B): every field the engine bound,
+the tensor it came from, and whether that pointer still lands on it. See *Tests*
+for what it proves and what it leaves to `fork_match`.
+
 The tokenizer is covered by `tokenizer@spm` and `tokenizer@bpe`, which compare
 the engine's ids against an independent Python implementation of both encoders
 over a generated vocabulary - covering the merges list, the score ordering and
@@ -358,11 +363,12 @@ so a test picks up the same sources and flags as the engine.
 | `q35_probe@<stem>` | `q35_probe` | a checkpoint |
 | `quant_dot@<stem>` | `quant_dot_test` | a checkpoint |
 | `gguf_probe@<stem>` | `tools/gguf_probe.py` | a checkpoint, `nita`, Python 3 |
+| `model_bind@<stem>` | `tools/gguf_probe.py --model-bind` | a checkpoint, `nita`, Python 3 |
 | `fork_match@<stem>` | `tools/check_fork_match.py` | a checkpoint and the fork driver |
 | `tokenizer_vocab` | `tools/make_tokenizer_gguf.py` | Python 3 |
 | `tokenizer@spm`, `tokenizer@bpe` | `tools/reference_tokenizer.py` | `nita`, Python 3 |
 
-The four that read a GGUF register once per checkpoint, named after the file
+The five that read a GGUF register once per checkpoint, named after the file
 (`Ternary-Bonsai-2-2B-PTQ1_0`, `Bonsai-27B-Q1_0`), so `-DNITA_TEST_MODELS`
 takes a semicolon-separated list and one configure covers every checkpoint on
 the machine:
@@ -396,6 +402,18 @@ difference names the tensor and both values instead of only moving the logits
 later. The 27B gets both passes in about 1.3 s even when its `fork_match` is
 deferred.
 
+`model_bind` opens the model at context 1 - enough to bind the weights, not
+enough to care about the KV cache - and reports every weight it ends up holding:
+which field, which tensor it was bound from, where that pointer lands and what
+is there. The probe checks each one against its own parse: the tensor exists,
+the pointer is where the header says, the bytes at it hash the same, the layer
+index in the field name matches the layer index in the tensor name, and no
+tensor is bound twice. That is what catches a request for `blk.5.x` stored in
+layer 4's slot, or a pointer that parses right and lands wrong, without paying
+for a fork comparison. What it cannot tell is whether the field *should* hold
+that tensor - `ffn_up` and `ffn_down` bound the wrong way round would pass here
+and fail in `fork_match` - so the two are complements, not substitutes.
+
 `tokenizer@spm` and `tokenizer@bpe` run the engine on the synthetic vocabulary
 `tokenizer_vocab` writes into the build directory; that entry is a setup fixture
 so either comparison pulls it in, and a mismatch in the merges, the score
@@ -409,7 +427,7 @@ seconds on the 2B, but 82 on the 27B - so on a checkpoint over a gigabyte
 cmake -S . -B build -DNITA_TEST_SLOW=ON    # + fork_match on the 27B, labelled slow
 ```
 
-That keeps a plain `ctest` around ten seconds on both checkpoints, since the
+That keeps a plain `ctest` around twelve seconds on both checkpoints, since the
 27B's `q35_probe` and `quant_dot` are about a second each and are the only
 cover its `Q1_0` quantisation gets; configure prints which entry it deferred,
 and `-L slow` runs exactly the deferred ones once they exist.
@@ -451,6 +469,8 @@ tensors respectively, with no tensor over the 1e-2 tolerance.
 --tensor-table      print the header facts and every tensor as tab-separated
                     name, type, dims, offset, bound pointer and a hash of the
                     bytes there (for gguf_probe.py --engine)
+--model-table       print every weight the loaded model holds: field, tensor,
+                    pointer offset and a hash of the bytes (for --model-bind)
 --logits <text>     tokenize text, run the forward pass, print logits
 --tokens <a,b,c>    run the forward pass on explicit token ids
 --prefill <n>       measure prompt processing: n tokens evaluated in one

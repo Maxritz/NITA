@@ -95,6 +95,81 @@ def fnv1a64(buf):
     return h
 
 
+def check_model(exe, path, tensors, data_offset, file_size):
+    """Every weight the loaded model holds, against the file it came from."""
+    proc = subprocess.run([exe, "--model", os.path.abspath(path),
+                           "--model-table"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"engine exited {proc.returncode}: "
+                         f"{proc.stderr.strip()[:300]}")
+
+    by_name = {t[0]: t for t in tensors}
+    layers = declared = None
+    rows = []
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 2 and fields[0] == "layers" and fields[1].isdigit():
+            layers = int(fields[1])
+        elif len(fields) == 2 and fields[0] == "model" and fields[1].isdigit():
+            declared = int(fields[1])
+        elif len(fields) == 4:
+            rows.append((fields[0], fields[1], int(fields[2]), int(fields[3], 16)))
+
+    problems = []
+    if layers is None:
+        problems.append("engine did not report its layer count")
+    if declared is None:
+        problems.append("engine did not report its weight count")
+    elif declared != len(rows):
+        problems.append(f"engine claims {declared} weights but listed {len(rows)}")
+    if not rows:
+        problems.append("engine reported no bound weights")
+
+    seen = set()
+    with open(path, "rb") as weights:
+        for role, name, abs_off, digest in rows:
+            if name in seen:
+                problems.append(f"{role}: {name} is bound twice")
+            seen.add(name)
+
+            info = by_name.get(name)
+            if info is None:
+                problems.append(f"{role}: {name} is not a tensor in the file")
+            else:
+                want = data_offset + info[3]
+                if abs_off != want:
+                    problems.append(f"{role}: {name} bound at {abs_off}, the "
+                                    f"header puts it at {want}")
+                else:
+                    weights.seek(abs_off)
+                    n = min(CHECK_BYTES, file_size - abs_off)
+                    if fnv1a64(weights.read(n)) != digest:
+                        problems.append(f"{role}: the bytes at {abs_off} are not "
+                                        f"what the model bound")
+
+            if role.endswith("]") and "[" in role:
+                here = int(role[role.rindex("[") + 1:-1])
+                if layers is not None and here >= layers:
+                    problems.append(f"{role}: layer {here} of {layers}")
+                if name.startswith("blk.") and not name.startswith(f"blk.{here}."):
+                    problems.append(f"{role}: bound {name}, which is not a "
+                                    f"layer {here} tensor")
+
+            if len(problems) > 5:
+                problems.append("... further differences not listed")
+                break
+
+    if problems:
+        print(f"model check     : DISAGREE ({len(problems)})")
+        for p in problems:
+            print(f"  {p}")
+        return False
+
+    print(f"model check     : AGREE ({len(rows)} weights over {layers} layers, "
+          f"pointer, bytes and layer index)")
+    return True
+
+
 def engine_table(exe, path):
     """Header facts and the whole tensor table as the engine parsed them."""
     proc = subprocess.run([exe, "--model", os.path.abspath(path),
@@ -131,8 +206,15 @@ def main():
             raise SystemExit("--engine needs the path to nita")
         engine = os.path.abspath(argv[i + 1])
         del argv[i:i + 2]
+    model_bind = False
+    if "--model-bind" in argv:
+        model_bind = True
+        argv.remove("--model-bind")
     if len(argv) != 1:
-        raise SystemExit("usage: gguf_probe.py [--engine nita.exe] model.gguf")
+        raise SystemExit("usage: gguf_probe.py [--engine nita.exe] "
+                         "[--model-bind] model.gguf")
+    if model_bind and not engine:
+        raise SystemExit("--model-bind compares the engine's bindings; give --engine")
     path = argv[0]
     with open(path, "rb") as f:
         r = Reader(f)
@@ -216,7 +298,10 @@ def main():
     ok = abs((expected - total)) <= align * 2
     print(f"layout check    : {'CONSISTENT' if ok else 'MISMATCH'}")
 
-    if engine:
+    if model_bind:
+        ok = check_model(engine, path, tensors, data_offset, file_size) and ok
+
+    if engine and not model_bind:
         # Header first, then every tensor: a reader that mis-reads one entry's
         # name, type, dims or offset is invisible to totals that still add up.
         want_hdr = {"version": version, "tensors": n_tensors, "keys": n_kv,

@@ -302,9 +302,108 @@ static bool bind_tensor(const gguf_file_t *g, nita_tensor_t *t, const char *name
         t->ne0   = src->n_dims > 0 ? src->dims[0] : 0;
         t->ne1   = src->n_dims > 1 ? src->dims[1] : 1;
         t->bound = true;
+        snprintf(t->name, sizeof t->name, "%s", name);
         return true;
     }
     return false;
+}
+
+/* One line for a weight the model actually holds: which field it is, which
+ * tensor it came from, where that pointer lands and what is there. Aliases (a
+ * tied output projection, qwen35's reused post-attention norm) are named the
+ * same tensor twice on purpose, so a repeated name is reported once. */
+static void report_weight(const gguf_file_t *g, const char *role,
+                          const nita_tensor_t *t, char **seen, int *nseen, int cap)
+{
+    uint64_t abs_off, n;
+    int      i;
+
+    if (!t->bound || !t->data || !t->name[0]) return;
+    for (i = 0; i < *nseen; ++i)
+        if (strcmp(seen[i], t->name) == 0) return;
+    if (*nseen >= cap) return;
+
+    seen[(*nseen)++] = (char *)t->name;
+    abs_off = (uint64_t)(t->data - g->data);
+    n = g->file_size - abs_off < NITA_TENSOR_CHECK_BYTES
+        ? (size_t)(g->file_size - abs_off)
+        : NITA_TENSOR_CHECK_BYTES;
+
+    printf("%s\t%s\t%llu\t%016llx\n", role, t->name,
+           (unsigned long long)abs_off, (unsigned long long)nita_fnv1a64(t->data, n));
+}
+
+int nita_model_tensor_report(const nita_model_t *m, const gguf_file_t *g)
+{
+    char  **seen;
+    char    role[64];
+    int     nseen = 0, l;
+
+    if (!m || !g || !m->ready) return -1;
+
+    seen = (char **)calloc((size_t)m->n_layer * 24 + 8, sizeof *seen);
+    if (!seen) return -1;
+
+    printf("layers\t%d\n", m->n_layer);
+
+    report_weight(g, "tok_embd", &m->tok_embd, seen, &nseen, m->n_layer * 24 + 8);
+    report_weight(g, "out_norm", &m->out_norm, seen, &nseen, m->n_layer * 24 + 8);
+    if (!m->tied_output)
+        report_weight(g, "out_proj", &m->out_proj, seen, &nseen, m->n_layer * 24 + 8);
+
+    for (l = 0; l < m->n_layer; ++l) {
+        const int cap = m->n_layer * 24 + 8;
+
+        snprintf(role, sizeof role, "attn_norm[%d]", l);
+        report_weight(g, role, &m->attn_norm[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "post_norm[%d]", l);
+        report_weight(g, role, &m->post_norm[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "ffn_norm[%d]", l);
+        report_weight(g, role, &m->ffn_norm[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "attn_q[%d]", l);
+        report_weight(g, role, &m->attn_q[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "attn_k[%d]", l);
+        report_weight(g, role, &m->attn_k[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "attn_v[%d]", l);
+        report_weight(g, role, &m->attn_v[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "attn_out[%d]", l);
+        report_weight(g, role, &m->attn_out[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "attn_q_norm[%d]", l);
+        report_weight(g, role, &m->attn_q_norm[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "attn_k_norm[%d]", l);
+        report_weight(g, role, &m->attn_k_norm[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "ffn_gate[%d]", l);
+        report_weight(g, role, &m->ffn_gate[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "ffn_up[%d]", l);
+        report_weight(g, role, &m->ffn_up[l], seen, &nseen, cap);
+        snprintf(role, sizeof role, "ffn_down[%d]", l);
+        report_weight(g, role, &m->ffn_down[l], seen, &nseen, cap);
+
+        if (m->is_qwen35 && m->layer_recr[l]) {
+            snprintf(role, sizeof role, "ssm_qkv[%d]", l);
+            report_weight(g, role, &m->q35_w[l].qkv, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_gate[%d]", l);
+            report_weight(g, role, &m->q35_w[l].gate, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_conv1d[%d]", l);
+            report_weight(g, role, &m->q35_w[l].conv1d, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_alpha[%d]", l);
+            report_weight(g, role, &m->q35_w[l].alpha, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_beta[%d]", l);
+            report_weight(g, role, &m->q35_w[l].beta, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_dt[%d]", l);
+            report_weight(g, role, &m->q35_w[l].dt_bias, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_a[%d]", l);
+            report_weight(g, role, &m->q35_w[l].ssm_a, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_norm[%d]", l);
+            report_weight(g, role, &m->q35_w[l].ssm_norm, seen, &nseen, cap);
+            snprintf(role, sizeof role, "ssm_out[%d]", l);
+            report_weight(g, role, &m->q35_w[l].out, seen, &nseen, cap);
+        }
+    }
+
+    printf("model\t%d\n", nseen);
+    free(seen);
+    return nseen;
 }
 
 int nita_bind_all(const gguf_file_t *g, nita_tensor_t *out, size_t cap)

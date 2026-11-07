@@ -3,11 +3,12 @@
  *
  *   nita --model <path.gguf> [--port 7777] [--host 0.0.0.0]
  *        [--ctx 2048] [--name <served-model-id>] [--quant-type Q]
- *        [--inspect] [--tensor-table] [--version] [--help]
+ *        [--inspect] [--tensor-table] [--model-table] [--version] [--help]
  *
  * --inspect prints the GGUF metadata and tensor table, then exits.
  * --tensor-table prints the header facts and every tensor as tab-separated
  * fields for tools/gguf_probe.py --engine to compare, then exits.
+ * --model-table does the same for the weights the loaded model bound.
  */
 
 #include "nita.h"
@@ -73,6 +74,8 @@ static void print_usage(FILE *f, const char *argv0)
         "  --inspect           print model metadata and exit\n"
         "  --tensor-table      print every tensor's name, type, dims, offsets\n"
         "                      and a hash of its first bytes, tab-separated\n"
+        "  --model-table       print every weight the loaded model holds: field,\n"
+        "                      tensor, pointer offset and hash\n"
         "  --tokenize <text>   print token ids and decode round-trip, then exit\n"
         "                      (\"-\" reads the text from stdin)\n"
         "  --logits <text>     run the forward pass on text, print logits\n"
@@ -808,20 +811,6 @@ static int run_logits(const gguf_file_t *g, const tokenizer_t *tok, const char *
     return 0;
 }
 
-#define TENSOR_CHECK_BYTES 64
-
-static uint64_t fnv1a64(const uint8_t *p, size_t n)
-{
-    uint64_t h = 0xcbf29ce484222325ULL;
-    size_t   i;
-
-    for (i = 0; i < n; ++i) {
-        h ^= (uint64_t)p[i];
-        h *= 0x100000001b3ULL;
-    }
-    return h;
-}
-
 /* One tensor per line: name, type id, dims, offset from the header, the absolute
  * file offset the forward pass will read it at, and a hash of the bytes that
  * pointer leads to. The human-readable --inspect listing stops at 40 tensors and
@@ -861,9 +850,9 @@ static int tensor_table(const gguf_file_t *g)
     for (i = 0; i < g->tensor_count; ++i) {
         const gguf_tensor_t *t = &g->tensors[i];
         uint64_t             abs_off = (uint64_t)(bound[i].data - g->data);
-        size_t               n = g->file_size - abs_off < TENSOR_CHECK_BYTES
+        size_t               n = g->file_size - abs_off < NITA_TENSOR_CHECK_BYTES
                                  ? (size_t)(g->file_size - abs_off)
-                                 : TENSOR_CHECK_BYTES;
+                                 : NITA_TENSOR_CHECK_BYTES;
         uint32_t             d;
 
         printf("%s\t%u\t", t->name, (unsigned)t->type);
@@ -871,7 +860,7 @@ static int tensor_table(const gguf_file_t *g)
             printf("%s%llu", d ? "," : "", (unsigned long long)t->dims[d]);
         printf("\t%llu\t%llu\t%016llx\n", (unsigned long long)t->offset,
                (unsigned long long)abs_off,
-               (unsigned long long)fnv1a64(bound[i].data, n));
+               (unsigned long long)nita_fnv1a64(bound[i].data, n));
     }
 
     free(bound);
@@ -948,6 +937,7 @@ int main(int argc, char **argv)
     int         ctx = 2048;
     int         want_inspect = 0;
     int         want_tensor_table = 0;
+    int         want_model_table = 0;
     int         bench_n = 0;
     int         prefill_n = 0;
     int         reps_n = 5;
@@ -977,6 +967,8 @@ int main(int argc, char **argv)
             want_inspect = 1;
         } else if (strcmp(a, "--tensor-table") == 0) {
             want_tensor_table = 1;
+        } else if (strcmp(a, "--model-table") == 0) {
+            want_model_table = 1;
         } else if (strcmp(a, "--bench") == 0 && i + 1 < argc) {
             bench_n = atoi(argv[++i]);
         } else if (strcmp(a, "--prefill") == 0 && i + 1 < argc) {
@@ -1050,6 +1042,27 @@ int main(int argc, char **argv)
             tokenizer_free(tok);
             gguf_free(g);
             return trc;
+        }
+
+        /* Build the engine only far enough to bind every weight: the report is
+         * about pointers, so the smallest context keeps the KV cache out of the
+         * way (a 64-layer model at the default 2048 is gigabytes of it). */
+        if (want_model_table) {
+            char          buf[256];
+            nita_model_t *engine = nita_model_open(g, 1, buf, sizeof buf);
+            int           mrc;
+
+            if (!engine) {
+                fprintf(stderr, "model not loadable: %s\n", buf);
+                tokenizer_free(tok);
+                gguf_free(g);
+                return 1;
+            }
+            mrc = nita_model_tensor_report(engine, g);
+            nita_model_close(engine);
+            tokenizer_free(tok);
+            gguf_free(g);
+            return mrc < 0 ? 1 : 0;
         }
 
         if (want_inspect) {

@@ -330,6 +330,16 @@ foreach(_model ${NITA_TEST_MODELS})
                          ${CMAKE_CURRENT_SOURCE_DIR}/tools/gguf_probe.py
                          --engine $<TARGET_FILE:nita> "${_model}")
         set_tests_properties(gguf_probe@${_tag} PROPERTIES LABELS "checkpoint")
+
+        # Every weight the loaded model holds, against the file: the reader
+        # check says the table is right, this says the bindings built from it
+        # point at the tensors they claim, layer by layer. It loads the model at
+        # context 1, so the KV cache of a 64-layer file never comes into play.
+        add_test(NAME model_bind@${_tag}
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/gguf_probe.py
+                         --engine $<TARGET_FILE:nita> --model-bind "${_model}")
+        set_tests_properties(model_bind@${_tag} PROPERTIES LABELS "checkpoint")
     endif()
 
     if(_fork_test_driver AND Python3_Interpreter_FOUND)
