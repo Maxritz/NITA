@@ -154,15 +154,11 @@ contiguous runs. With 48 v heads over 16 k heads the blocked reading pairs each
 value head with the wrong query, and the mixer output drops to cosine 0.81 while
 every input to it stays exact - which is what localised it.
 
-`tests/q35_heads_test.c` pins the convention, since no run of the 2B can:
-
-```
-gcc -I src tests/q35_heads_test.c -o build/q35_heads_test && build/q35_heads_test
-```
-
-It walks the 27B geometry (48 value heads over 16 key heads), checks that each
-key head feeds an equal share, and reports both readings' tables. Swapping the
-mapping back to blocked indexing makes it fail in 76 places.
+`tests/q35_heads_test.c` pins the convention, since no run of the 2B can. It
+walks the 27B geometry (48 value heads over 16 key heads), checks that each key
+head feeds an equal share, and reports both readings' tables; swapping the
+mapping back to blocked indexing makes it fail in 76 places. It runs under CTest
+with the rest of the suite (see *Tests* under Build).
 
 Getting there took one real bug, found by measurement rather than inspection.
 The delta-rule output must be scaled by `1/sqrt(head_v_dim)` before the gated
@@ -264,6 +260,32 @@ Exactly one quantisation flag should be enabled; the build derives
 `QUANT_TYPE` from it. The transformer itself reads the per-tensor types
 recorded in the GGUF file, so a single binary handles every quantised tensor
 found in a checkpoint.
+
+### Tests
+
+```bash
+cmake --build build && ctest --test-dir build --output-on-failure
+```
+
+Everything but `main()` is built into a `nita_core` library that the tests link,
+so a test picks up the same sources and flags as the engine.
+
+| Test | Target | Needs a checkpoint |
+|------|--------|--------------------|
+| `hadamard` | `hadamard_test` | no |
+| `q35_heads` | `q35_heads_test` | no |
+| `q35_probe` | `q35_probe` | yes |
+| — | `quant_dot_test` | yes, plus a type id: `<model.gguf> <type-id> [rows]` |
+
+The two that read a GGUF register only when one is named:
+
+```bash
+cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf
+```
+
+`quant_dot_test` stays a plain target because it also takes a tensor type: it
+compares one type's kernel against the float reference over the tensors a
+checkpoint actually stores, as `build/quant_dot_test <model.gguf> <type-id>`.
 
 ## Run
 
@@ -676,10 +698,14 @@ src/dequant.c      block dequantisation for every supported tensor type
 src/json.c         JSON parser and escaper
 src/tokenizer.c    vocabulary + encode/decode
 src/transformer.c  tensor binding, forward pass, sampling, generation
+src/qwen35.c       gated delta-net mixer for the Bonsai hybrid architecture
+src/quant.c        IQ4_XS / MXFP4 / TQ1_0 codecs and integer dot kernels
+src/hadamard.c     block Hadamard rotation folded into the Bonsai matmuls
 src/chat.c         conversation history and completion path
 src/http.c         HTTP/1.1 server and OpenAI routes
 src/main.c         CLI entry point
 src/q4_matmul.c    quantised GEMV kernels
+tests/             CTest entry points (see Tests under Build)
 tools/             model generators, reference implementation, comparators
 ```
 

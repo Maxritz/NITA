@@ -75,6 +75,11 @@ int main(int argc, char **argv)
     if (!g) { fprintf(stderr, "load failed: %s\n", err); return 1; }
     G = g;
 
+    /* Zero both, not just cfg: the weight struct carries the Hadamard rotation
+     * descriptors, and a NULL transform is what `rot_in` expects when a
+     * checkpoint does not fold one in. Left uninitialised they hold stack
+     * garbage and the first projection dereferences it. */
+    memset(&w,   0, sizeof w);
     memset(&cfg, 0, sizeof cfg);
     cfg.n_embd      = (int)gguf_get_int(g, "qwen35.embedding_length", 0);
     cfg.n_k_heads   = (int)gguf_get_int(g, "qwen35.ssm.group_count", 0);

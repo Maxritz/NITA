@@ -93,10 +93,10 @@ endif()
 add_compile_options(${QUANT_TYPE})
 
 # ------------------------------------------------------------------
-# Source files – the core kernel plus a minimal main
+# Source files – everything but main(), so the tests can link the same
+# objects instead of repeating this list (and its flags) per test.
 # ------------------------------------------------------------------
-add_executable(nita
-    src/main.c
+add_library(nita_core STATIC
     src/util.c
     src/gguf.c
     src/json.c
@@ -111,15 +111,20 @@ add_executable(nita
     src/q4_matmul.c
 )
 
+target_include_directories(nita_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # libm for expf/cosf/powf/sqrtf.
 if(NOT MSVC)
-    target_link_libraries(nita PRIVATE m)
+    target_link_libraries(nita_core PUBLIC m)
 endif()
 
 # Winsock is required by the HTTP server on Windows.
 if(WIN32)
-    target_link_libraries(nita PRIVATE ws2_32)
+    target_link_libraries(nita_core PUBLIC ws2_32)
 endif()
+
+add_executable(nita src/main.c)
+target_link_libraries(nita PRIVATE nita_core)
 
 # Keep the historical binary name working for existing scripts.
 if(WIN32)
@@ -130,6 +135,39 @@ else()
     add_custom_command(TARGET nita POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:nita> $<TARGET_FILE_DIR:nita>/minimal_engine)
+endif()
+
+# ------------------------------------------------------------------
+# Tests
+#
+#   cmake --build build && ctest --test-dir build
+#
+# hadamard and q35_heads need no checkpoint, so they always register. The two
+# that read a model file are built unconditionally and registered only when one
+# is supplied with -DNITA_TEST_MODEL=<path>. tests/kernel_test.c and
+# tests/model_test.c are left out: neither has a main(), and the first includes
+# a header the tree no longer has.
+# ------------------------------------------------------------------
+include(CTest)
+set(NITA_TEST_MODEL "" CACHE FILEPATH
+    "Bonsai checkpoint for the q35_probe test; empty to skip it")
+
+add_executable(hadamard_test tests/hadamard_test.c)
+target_link_libraries(hadamard_test PRIVATE nita_core)
+add_test(NAME hadamard COMMAND hadamard_test)
+
+add_executable(q35_heads_test tests/q35_heads_test.c)
+target_link_libraries(q35_heads_test PRIVATE nita_core)
+add_test(NAME q35_heads COMMAND q35_heads_test)
+
+add_executable(q35_probe tests/q35_probe.c)
+target_link_libraries(q35_probe PRIVATE nita_core)
+
+add_executable(quant_dot_test tests/quant_dot_test.c)
+target_link_libraries(quant_dot_test PRIVATE nita_core)
+
+if(NITA_TEST_MODEL)
+    add_test(NAME q35_probe COMMAND q35_probe ${NITA_TEST_MODEL})
 endif()
 
 message(STATUS "Project: NITA (NC Inference Tool for All)")
