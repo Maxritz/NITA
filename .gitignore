@@ -3,3 +3,4 @@ build/
 ecc/
 __pycache__/
 *.pyc
+build_exact/

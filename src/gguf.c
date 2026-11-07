@@ -155,6 +155,75 @@ static const ggml_type_info_t g_ggml_types[] = {
     { 143, "PTQ1_0", 128,  28 }    /* ternary, dense base-3 trits, group 128 (PrismML) */
 };
 
+/*
+ * Type id 42 has two meanings in the wild.  prism-v5 (and the frozen `prism`
+ * branch) stored the ternary group-128 layout under 42; mainline llama.cpp
+ * standardised 42 as group 64, and prism-v7 moved the fork's group-128 layout
+ * to its own id, PQ2_0 (142).  The deprecated *-Q2_0.gguf files that are still
+ * on the HuggingFace repos are the old group-128 layout under 42, so every row
+ * of them is 34 bytes per 128 weights where this build expects 18 per 64.  A
+ * reader that simply follows the current mapping decodes such a file as
+ * garbage instead of refusing it, so check the byte span each type-42 tensor
+ * actually occupies: a span too small for group 64 but large enough for group
+ * 128 is the legacy layout.
+ */
+static bool check_q2_0_layout(const gguf_file_t *g, char *err, size_t errlen)
+{
+    const uint64_t data_bytes = g->file_size - g->data_offset;
+    uint64_t       i, j;
+
+    for (i = 0; i < g->tensor_count; ++i) {
+        const gguf_tensor_t *t = &g->tensors[i];
+        uint64_t             rows, need, legacy, span, next = 0;
+        bool                 have_next = false;
+
+        if (t->type != 42 || t->n_dims == 0) continue;
+        if ((t->dims[0] % 128u) != 0) continue;  /* only group 128 would fit */
+        if (t->offset > data_bytes) {
+            snprintf(err, errlen,
+                     "tensor '%s' starts past the end of the data section",
+                     t->name);
+            return false;
+        }
+
+        /* the span this tensor occupies is the gap to the next tensor record */
+        for (j = 0; j < g->tensor_count; ++j) {
+            const uint64_t o = g->tensors[j].offset;
+            if (o > t->offset && (!have_next || o < next)) {
+                next      = o;
+                have_next = true;
+            }
+        }
+        span = (have_next ? next : data_bytes) - t->offset;
+
+        rows   = t->n_dims > 1 ? t->dims[1] : 1;
+        need   = (uint64_t)nita_row_bytes(42, t->dims[0]) * rows;
+        legacy = (t->dims[0] / 128u) * 34u * rows;
+
+        if (span >= need) continue;     /* consistent with group 64 */
+
+        if (span >= legacy) {
+            snprintf(err, errlen,
+                     "this file matches the legacy Prism Q2_0 layout "
+                     "(group size 128 stored as ggml type id 42): tensor '%s' "
+                     "holds %llu bytes, but Q2_0 is read here as the official "
+                     "group-64 format and needs %llu. Use the *_g64 or PQ2_0 "
+                     "file for this model",
+                     t->name, (unsigned long long)span,
+                     (unsigned long long)need);
+        } else {
+            snprintf(err, errlen,
+                     "tensor '%s' is truncated: the file gives it %llu bytes "
+                     "but ggml type 42 needs %llu",
+                     t->name, (unsigned long long)span,
+                     (unsigned long long)need);
+        }
+        return false;
+    }
+
+    return true;
+}
+
 static const ggml_type_info_t *find_type(uint32_t id)
 {
     size_t i;
@@ -526,6 +595,11 @@ gguf_file_t *gguf_load(const char *path, char *err, size_t errlen)
                  "tensor data offset %llu beyond end of file (%llu bytes)",
                  (unsigned long long)g->data_offset,
                  (unsigned long long)g->file_size);
+        gguf_free(g);
+        return NULL;
+    }
+
+    if (!check_q2_0_layout(g, err, errlen)) {
         gguf_free(g);
         return NULL;
     }

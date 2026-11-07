@@ -10,6 +10,7 @@
 
 #include "nita.h"
 
+#include <math.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -332,10 +333,10 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
             }
             {
                 uint32_t tmp = aux[2];
-                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp) & kmask1) << 4);
-                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 2) & kmask1) << 4);
-                aux[0] = ((aux[0] & kmask2) | (((tmp >> 4) & kmask1) << 4));
-                aux[1] = ((aux[1] & kmask2) | (((tmp >> 6) & kmask1) << 4));
+                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                aux[0] = ((aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4));
+                aux[1] = ((aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4));
             }
             for (is = 0; is < 16; ++is) {
                 int v = (int)((aux[is / 4] >> (8 * (is % 4))) & 0xFF);
@@ -459,10 +460,65 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
                     y[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
                     y[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
                 }
-                y  += 128;
+                /* y must not advance here: n already carries the 128-element
+                 * half, and doing both walked 256 floats past the row. */
                 ql += 64;
                 qh += 32;
                 sc += 8;
+            }
+        }
+        return 0;
+    }
+
+    case 23: { /* IQ4_XS: 256 elements, 136 bytes */
+        /* Non-linear 4-bit codebook; the values are the ggml table verbatim.
+         * Indexing it with the nibble is the whole of IQ4_XS decoding: unlike
+         * Q4_K the nibble is not a linear offset. */
+        static const int8_t kv[16] = {
+            -127, -104, -83, -65, -49, -35, -22, -10,
+               1,   13,  25,  38,  53,  69,  89, 113
+        };
+        uint64_t nb = ne0 / 256;
+
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 136;
+            float          d   = rd_f16(blk);
+            uint16_t       h   = (uint16_t)(blk[2] | (blk[3] << 8));
+            const uint8_t *sl  = blk + 4;
+            const uint8_t *qs  = blk + 8;
+            float         *y   = dst + i * 256;
+            int            ib;
+
+            for (ib = 0; ib < 8; ++ib) {
+                int ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+                       | (((h >> (2 * ib)) & 3) << 4);
+                float dl = d * (float)(ls - 32);
+                int   l;
+
+                for (l = 0; l < 16; ++l) {
+                    y[ib * 32 + l]      = dl * (float)kv[qs[ib * 16 + l] & 0x0F];
+                    y[ib * 32 + 16 + l] = dl * (float)kv[qs[ib * 16 + l] >> 4];
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 39: { /* MXFP4: 32 elements, 17 bytes: E8M0 exponent + 16 code bytes */
+        /* e2m1 values, doubled, so the scale carries the missing half. */
+        static const int8_t kv[16] = {
+            0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+        };
+        uint64_t nb = ne0 / 32;
+
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 17;
+            float          d   = exp2f((float)blk[0] - 128.0f);
+            int            l;
+
+            for (l = 0; l < 16; ++l) {
+                dst[i * 32 + l]      = d * (float)kv[blk[1 + l] & 0x0F];
+                dst[i * 32 + 16 + l] = d * (float)kv[blk[1 + l] >> 4];
             }
         }
         return 0;
@@ -560,6 +616,65 @@ int nita_dequant_row(const uint8_t *src, uint32_t type, uint64_t ne0, float *dst
                     *y++ = (float)(xi - 1) * d;
                 }
             }
+        }
+        return 0;
+    }
+
+    case 34: { /* TQ1_0: 256 elements, 54 bytes, dense base-3 trits, group 256 */
+        static const size_t  stages[3] = { 32, 16, 8 };
+        static const uint8_t pow3[6]    = { 1, 3, 9, 27, 81, 243 };
+        uint64_t nb = ne0 / 256;
+
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 54;
+            const uint8_t *qs  = blk;        /* 48 bytes: 5 trits each */
+            const uint8_t *qh  = blk + 48;   /*  4 bytes: 4 trits each */
+            float d = rd_f16(blk + 52);
+            float *y = dst + i * 256;
+            size_t j = 0, s, m, n;
+
+            /* the same staged walk PTQ1_0 uses: 32 bytes (160 values) then
+             * 16 bytes (80 values), which is exactly upstream's hard-coded
+             * 32-then-16 layout for a 48-byte qs */
+            for (s = 0; s < 3; ++s) {
+                size_t c = stages[s];
+                for (; j + c <= 48; j += c) {
+                    for (n = 0; n < 5; ++n) {
+                        for (m = 0; m < c; ++m) {
+                            uint8_t q  = (uint8_t)(qs[j + m] * pow3[n]);
+                            int16_t xi = (int16_t)(((uint16_t)q * 3) >> 8);
+                            *y++ = (float)(xi - 1) * d;
+                        }
+                    }
+                }
+            }
+            for (n = 0; n < 4; ++n) {
+                for (m = 0; m < 4; ++m) {
+                    uint8_t q  = (uint8_t)(qh[m] * pow3[n]);
+                    int16_t xi = (int16_t)(((uint16_t)q * 3) >> 8);
+                    *y++ = (float)(xi - 1) * d;
+                }
+            }
+        }
+        return 0;
+    }
+
+    case 35: { /* TQ2_0: 256 elements, 66 bytes, 2-bit slots, group 256 */
+        uint64_t nb = ne0 / 256;
+
+        for (i = 0; i < nb; ++i) {
+            const uint8_t *blk = src + i * 66;
+            const uint8_t *qs  = blk;        /* 64 bytes, 4 slots each */
+            float d = rd_f16(blk + 64);      /* scale last, unlike Q2_0 */
+            float *y = dst + i * 256;
+            size_t g, l, m;
+
+            /* slot l is a bit plane across 32 stored bytes, so it covers 32
+             * consecutive elements: upstream calls this "along 32 bytes" */
+            for (g = 0; g < 2; ++g)
+                for (l = 0; l < 4; ++l)
+                    for (m = 0; m < 32; ++m)
+                        *y++ = (float)(((qs[g * 32 + m] >> (2 * l)) & 3) - 1) * d;
         }
         return 0;
     }

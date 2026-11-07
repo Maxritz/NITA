@@ -12,6 +12,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 
 /* Kernel entry point provided by q4_matmul.c (one implementation is
  * compiled in, chosen by the CMake -D flags). */
@@ -67,6 +73,14 @@ static void print_usage(FILE *f, const char *argv0)
         "                      (\"-\" reads the text from stdin)\n"
         "  --logits <text>     run the forward pass on text, print logits\n"
         "  --tokens <a,b,c>    run the forward pass on explicit token ids\n"
+        "  --prefill <n>       measure prompt processing: n tokens evaluated in\n"
+        "                      one pass (NITA_PREFILL_SEQ=1 for the old\n"
+        "                      one-token-at-a-time path)\n"
+        "  --bench <n>         measure decode throughput and dump the component\n"
+        "                      profile (n single-token forwards)\n"
+        "  --reps <n>          runs per benchmark, reported as a median with a\n"
+        "                      spread warning (default 5; NITA_REP_SPREAD sets\n"
+        "                      the warning threshold in percent)\n"
         "  --version           print version and exit\n"
         "  --help              show this message\n"
         "\n"
@@ -172,7 +186,7 @@ static int run_logits_ids(const gguf_file_t *g, const int32_t *ids, size_t n)
     int           nv;
     size_t        i;
 
-    m = nita_model_open(g, 256, err, sizeof err);
+    m = nita_model_open(g, n + 16 > 256 ? (int)n + 16 : 256, err, sizeof err);
     if (!m) {
         fprintf(stderr, "nita: %s\n", err);
         return 1;
@@ -181,13 +195,15 @@ static int run_logits_ids(const gguf_file_t *g, const int32_t *ids, size_t n)
     nv = nita_model_n_vocab(m);
     logits = (float *)calloc((size_t)nv, sizeof(float));
 
-    for (i = 0; i < n; ++i) {
-        if (nita_forward(m, ids[i], logits) != 0) {
-            fprintf(stderr, "nita: forward failed at token %zu\n", i);
-            free(logits);
-            nita_model_close(m);
-            return 1;
-        }
+    /* One call for the whole run. The tiled path is the default; with
+     * NITA_PREFILL_SEQ=1 the same ids go through nita_forward one at a time,
+     * so comparing the two outputs checks the tiled path against the
+     * reference (identical up to float rounding in the attention pass). */
+    if (nita_prefill(m, ids, (int)n, logits) != 0) {
+        fprintf(stderr, "nita: forward failed on %zu tokens\n", n);
+        free(logits);
+        nita_model_close(m);
+        return 1;
     }
 
     printf("tokens:");
@@ -197,6 +213,540 @@ static int run_logits_ids(const gguf_file_t *g, const int32_t *ids, size_t n)
     printf("\n");
 
     free(logits);
+    nita_model_close(m);
+    return 0;
+}
+
+/* Measure prompt processing: the whole run through the engine in one pass.
+ * With NITA_PREFILL_SEQ=1 the same tokens go through one forward each, which
+ * is the pre-tiling path, so the two runs are directly comparable. */
+/* ------------------------------------------------------------------ */
+/* Repeated measurement                                                */
+/* ------------------------------------------------------------------ */
+/*
+ * One run of either benchmark is not reproducible on this machine: background
+ * load moves the same workload by tens of percent between runs, so a single
+ * number is partly a measurement of what else was running. Both modes
+ * therefore repeat the measurement and report the median, and a set whose
+ * spread is too wide says so instead of being quoted as a result.
+ *
+ * --reps <n>            runs to take (default 5, clamped to 1..15)
+ * NITA_REP_SPREAD=<pct> spread that triggers the warning (default 10,
+ *                       0 disables the warning)
+ */
+
+#define NITA_MAX_REPS 15
+
+/* Why a single run was slow.
+ *
+ * A median hides the reason one run drifted, so every run is bracketed by two
+ * cheap counter reads. Our own process CPU says how much of the machine we
+ * asked for; the system counters say how much everything else did. The gap
+ * between them is the load that actually competes with us, and it is usually
+ * the whole explanation for a run that was slow in isolation.
+ */
+typedef struct {
+    double proc_s;      /* this process, kernel + user, seconds */
+    double busy_s;      /* every process, busy seconds        */
+    int    have_sys;
+} load_snap_t;
+
+typedef struct {
+    int             reps;                              /* requested */
+    int             n;                                 /* recorded  */
+    double          secs[NITA_MAX_REPS];
+    double          cpu[NITA_MAX_REPS];      /* our cores busy, mean */
+    double          sys[NITA_MAX_REPS];      /* machine busy, 0..1   */
+    double          other[NITA_MAX_REPS];    /* cores busy elsewhere */
+    int             have_sys;
+    int             ncpu;
+    int             keep[NITA_MAX_REPS];     /* 1 = counted in the median */
+    int             nkeep;
+    double          load_lim;                /* cores of external load */
+    nita_prof_row_t prof[NITA_MAX_REPS][NITA_PROF_MAX_ROWS];
+    int             nprof;
+} rep_set_t;
+
+#if defined(_WIN32)
+static double ft_secs(FILETIME t)
+{
+    return ((double)t.dwHighDateTime * 4294967296.0 +
+            (double)t.dwLowDateTime) / 1e7;
+}
+#endif
+
+static int cpu_count(void)
+{
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+#else
+    return 1;
+#endif
+}
+
+static void load_snap(load_snap_t *s)
+{
+    s->proc_s   = 0.0;
+    s->busy_s   = 0.0;
+    s->have_sys = 0;
+#if defined(_WIN32)
+    {
+        FILETIME cre, ext, kern, user, idle, skern, suser;
+
+        if (GetProcessTimes(GetCurrentProcess(), &cre, &ext, &kern, &user)) {
+            s->proc_s = ft_secs(kern) + ft_secs(user);
+            if (GetSystemTimes(&idle, &skern, &suser)) {
+                /* GetSystemTimes folds idle into the kernel figure. */
+                s->busy_s   = ft_secs(skern) - ft_secs(idle) + ft_secs(suser);
+                s->have_sys = 1;
+            }
+        }
+    }
+#else
+    s->proc_s = (double)clock() / (double)CLOCKS_PER_SEC;
+#endif
+}
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a;
+    double y = *(const double *)b;
+
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+static double median_of(const double *v, int n)
+{
+    double tmp[NITA_MAX_REPS];
+    int    i;
+
+    if (n <= 0) return 0.0;
+    if (n > NITA_MAX_REPS) n = NITA_MAX_REPS;
+    for (i = 0; i < n; ++i) tmp[i] = v[i];
+    qsort(tmp, (size_t)n, sizeof tmp[0], cmp_double);
+    return (n & 1) ? tmp[n / 2] : 0.5 * (tmp[n / 2 - 1] + tmp[n / 2]);
+}
+
+static void rep_init(rep_set_t *r, int reps)
+{
+    memset(r, 0, sizeof *r);
+    if (reps < 1) reps = 1;
+    if (reps > NITA_MAX_REPS) reps = NITA_MAX_REPS;
+    r->reps = reps;
+    r->ncpu = cpu_count();
+}
+
+/* `a` and `b` bracket the run whose wall time is `secs`. */
+static void rep_record(rep_set_t *r, double secs,
+                       const load_snap_t *a, const load_snap_t *b)
+{
+    double wall = secs > 1e-9 ? secs : 1e-9;
+    double dproc, dbusy;
+
+    if (r->n >= r->reps) return;
+    r->secs[r->n] = secs;
+    r->keep[r->n] = 1;
+
+    dproc = b->proc_s - a->proc_s;
+    dbusy = b->busy_s - a->busy_s;
+    r->cpu[r->n] = dproc / wall;
+    if (b->have_sys && r->ncpu > 0) {
+        r->sys[r->n]   = dbusy / (wall * (double)r->ncpu);
+        r->other[r->n] = r->sys[r->n] * (double)r->ncpu - r->cpu[r->n];
+        if (r->other[r->n] < 0.0) r->other[r->n] = 0.0;
+        r->have_sys    = 1;
+    }
+    r->nprof = nita_prof_rows(r->prof[r->n], NITA_PROF_MAX_ROWS);
+    ++r->n;
+    r->nkeep = r->n;
+}
+
+/* Drop runs that ran under far more external load than the rest of the set.
+ *
+ * The test uses the load counters only, never the timings, so this cannot
+ * select on the result: a run is excluded because the machine was busy, not
+ * because it came out slow.
+ *
+ * The baseline is the quietest run in the set, not the middle one. If load
+ * arrived halfway through, most runs are polluted and their median would be
+ * the polluted level, so the clean minority would look like the outlier and
+ * nothing would be discarded. The lightest run is the best available estimate
+ * of what this machine costs when the benchmark has it to itself, and the
+ * margin below it absorbs ordinary jitter.
+ *
+ * Two runs always survive, and the report says so, because a median of two is
+ * a mean and has no spread of its own.
+ * NITA_REP_LOAD=<cores> pins the limit instead of deriving it.
+ */
+static void rep_mark_clean(rep_set_t *r)
+{
+    const char *e = getenv("NITA_REP_LOAD");
+    double      pinned = e ? atof(e) : 0.0;
+    double      base, margin, lim;
+    int         i, kept = 0, floor_n;
+
+    if (!r->have_sys || r->n < 3) return;
+
+    base = r->other[0];
+    for (i = 1; i < r->n; ++i)
+        if (r->other[i] < base) base = r->other[i];
+
+    /* Half the baseline, but never less than two cores: small absolute loads
+     * must not be split into "quiet" and "polluted" on noise alone. */
+    margin = base * 0.5 > 2.0 ? base * 0.5 : 2.0;
+    lim = pinned > 0.0 ? pinned : base + margin;
+    r->load_lim = lim;
+
+    for (i = 0; i < r->n; ++i)
+        if (r->other[i] > lim) r->keep[i] = 0;
+
+    for (i = 0; i < r->n; ++i) kept += r->keep[i];
+    floor_n = 2;                    /* a median needs two numbers */
+    while (kept < floor_n) {
+        int worst = -1;
+
+        for (i = 0; i < r->n; ++i)
+            if (!r->keep[i] && (worst < 0 || r->other[i] < r->other[worst]))
+                worst = i;
+        if (worst < 0) break;
+        r->keep[worst] = 1;
+        ++kept;
+    }
+    r->nkeep = kept;
+}
+
+static double rep_median_secs(const rep_set_t *r)
+{
+    double v[NITA_MAX_REPS];
+    int    i, n = 0;
+
+    for (i = 0; i < r->n; ++i)
+        if (r->keep[i]) v[n++] = r->secs[i];
+    return n ? median_of(v, n) : median_of(r->secs, r->n);
+}
+
+/* Says which runs were left out and on what evidence. */
+static void rep_report_excluded(const rep_set_t *r)
+{
+    int i, dropped = 0, worst = -1;
+
+    for (i = 0; i < r->n; ++i) {
+        if (r->keep[i]) continue;
+        ++dropped;
+        if (worst < 0 || r->other[i] > r->other[worst]) worst = i;
+    }
+    if (!dropped) return;
+    printf("  excluded: %d of %d runs, external load above %.1f cores "
+           "(worst run %d at %.1f)\n",
+           dropped, r->n, r->load_lim, worst + 1, r->other[worst]);
+    if (r->nkeep < 3)
+        printf("  note: %d runs left; the median is the mean of two and "
+               "carries no spread of its own\n", r->nkeep);
+    fflush(stdout);
+}
+
+static void rep_print_runs(const rep_set_t *r, long units)
+{
+    int i;
+
+    if (r->n < 2 || units <= 0) return;
+    if (r->have_sys)
+        printf("  load: cpu = our cores busy, sys = whole machine busy, "
+               "other = the rest\n");
+    for (i = 0; i < r->n; ++i) {
+        printf("  run %d: %.3f s  %.2f ms/token", i + 1, r->secs[i],
+               1000.0 * r->secs[i] / (double)units);
+        if (r->have_sys)
+            printf("   cpu %.1f  sys %2.0f%%  other %.1f",
+                   r->cpu[i], 100.0 * r->sys[i], r->other[i]);
+        if (!r->keep[i])
+            printf("   [excluded: load]");
+        printf("\n");
+    }
+}
+
+/* Gap between the fastest and slowest run, relative to their median. */
+static void rep_report_spread(const rep_set_t *r, long units)
+{
+    const char *e = getenv("NITA_REP_SPREAD");
+    double      limit = e ? atof(e) : 10.0;
+    double      v[NITA_MAX_REPS];
+    double      lo, hi, med, pct;
+    int         i, nv = 0;
+    int         lo_i = -1, hi_i = -1;    /* run indices, for the load line */
+    int         lo_v = 0, hi_v = 0;      /* and their places in v[]      */
+
+    if (r->n < 2 || units <= 0) return;
+
+    /* Spread of the runs that survived, which is the spread of the number
+     * being reported above it. The excluded runs are accounted for on their
+     * own line, so nothing disappears silently. */
+    for (i = 0; i < r->n; ++i) {
+        if (!r->keep[i]) continue;
+        v[nv] = 1000.0 * r->secs[i] / (double)units;
+        if (lo_i < 0 || v[nv] < v[lo_v]) { lo_i = i; lo_v = nv; }
+        if (hi_i < 0 || v[nv] > v[hi_v]) { hi_i = i; hi_v = nv; }
+        ++nv;
+    }
+    if (lo_i < 0 || hi_i < 0) return;
+    lo = v[lo_v];
+    hi = v[hi_v];
+    med = median_of(v, nv);
+    pct = med > 0.0 ? 100.0 * (hi - lo) / med : 0.0;
+
+    printf("  spread: %.1f%% over %d runs (min %.2f, max %.2f ms/token)\n",
+           pct, nv, lo, hi);
+
+    /* Attribute the spread: a slow run under someone else's load is not the
+     * same evidence as a slow run on an otherwise idle machine. */
+    if (r->have_sys) {
+        printf("  load: fastest run cpu %.1f sys %.0f%% other %.1f | "
+               "slowest run cpu %.1f sys %.0f%% other %.1f (%d CPUs)\n",
+               r->cpu[lo_i], 100.0 * r->sys[lo_i], r->other[lo_i],
+               r->cpu[hi_i], 100.0 * r->sys[hi_i], r->other[hi_i], r->ncpu);
+    }
+    if (limit > 0.0 && pct > limit)
+        printf("  WARNING: spread exceeds %.0f%% - this number is not stable on "
+               "this machine right now\n", limit);
+    fflush(stdout);
+}
+
+/* Component table of the run set: each row is the median of that component
+ * across runs, so one slow run cannot move any of them. */
+static void rep_print_profile(const rep_set_t *r)
+{
+    nita_prof_row_t med[NITA_PROF_MAX_ROWS];
+    double          tot = 0.0;
+    int             nprof = r->n ? r->nprof : 0;
+    int             i, k;
+
+    if (nprof <= 0) return;
+
+    for (i = 0; i < nprof; ++i) {
+        double us[NITA_MAX_REPS], calls[NITA_MAX_REPS];
+        int    nk = 0;
+
+        /* Same runs as the reported timing: an excluded run must not drag
+         * the component medians either. */
+        for (k = 0; k < r->n; ++k) {
+            if (!r->keep[k]) continue;
+            us[nk]    = r->prof[k][i].us;
+            calls[nk] = (double)r->prof[k][i].calls;
+            ++nk;
+        }
+        if (nk == 0) { us[0] = 0.0; calls[0] = 0.0; nk = 1; }
+        med[i].name   = r->prof[0][i].name;
+        med[i].us     = median_of(us, nk);
+        med[i].calls  = (long)median_of(calls, nk);
+        med[i].subset = r->prof[0][i].subset;
+        if (!med[i].subset) tot += med[i].us;
+    }
+    if (tot <= 0.0) tot = 1.0;
+
+    printf("%-16s%8s%14s%12s%8s\n", "component", "calls", "total_us", "us/call", "%");
+    for (i = 0; i < nprof; ++i) {
+        printf("%-16s%8ld%14.1f%12.2f%7.1f%%\n",
+               med[i].name, med[i].calls, med[i].us,
+               med[i].calls ? med[i].us / (double)med[i].calls : 0.0,
+               100.0 * med[i].us / tot);
+    }
+    printf("%-16s%8s%14.1f\n", "sum", "", tot);
+    fflush(stdout);
+}
+
+static int run_prefill(const gguf_file_t *g, const tokenizer_t *tok, int n, int reps)
+{
+    char          err[256];
+    nita_model_t *m;
+    int32_t      *base = NULL, *ids = NULL;
+    size_t        nbase = 0, i;
+    float        *logits;
+    int           nv, rc = 1;
+    clock_t       t0;
+    double        secs;
+    const char   *seq;
+    rep_set_t     set;
+    int           rep_ok = 1;
+    int           rep_i;
+
+    if (!tok || !tok->has_vocab) {
+        fprintf(stderr, "nita: model has no vocabulary; cannot tokenize\n");
+        return 1;
+    }
+    if (n <= 0) n = 32;
+
+    m = nita_model_open(g, n + 8, err, sizeof err);
+    if (!m) {
+        fprintf(stderr, "nita: %s\n", err);
+        return 1;
+    }
+
+    base = tokenizer_encode(tok, "The quick brown fox jumps over the lazy dog. "
+                                 "Prompt processing should stream the weights "
+                                 "once for the whole prompt, not once per token.",
+                            &nbase);
+    if (!base || nbase == 0) {
+        fprintf(stderr, "nita: tokenization produced no tokens\n");
+        nita_model_close(m);
+        return 1;
+    }
+
+    ids = (int32_t *)calloc((size_t)n, sizeof(int32_t));
+    for (i = 0; i < (size_t)n; ++i) ids[i] = base[i % nbase];
+
+    nv = nita_model_n_vocab(m);
+    logits = (float *)calloc((size_t)nv, sizeof(float));
+
+    /* Warm the tile buffers with a short pass so the first recorded run is not
+     * the one paying for their allocation. */
+    nita_model_reset(m);
+    if (nita_prefill(m, ids, n < 8 ? n : 8, logits) != 0) {
+        fprintf(stderr, "nita: prefill failed\n");
+        goto done;
+    }
+
+    rep_init(&set, reps);
+    for (rep_i = 0; rep_i < set.reps; ++rep_i) {
+        load_snap_t la, lb;
+
+        nita_model_reset(m);
+        nita_prof_reset();
+        load_snap(&la);
+        t0 = clock();
+        if (nita_prefill(m, ids, n, logits) != 0) {
+            fprintf(stderr, "nita: prefill failed\n");
+            rep_ok = 0;
+            break;
+        }
+        load_snap(&lb);
+        rep_record(&set, (double)(clock() - t0) / (double)CLOCKS_PER_SEC, &la, &lb);
+    }
+    if (!rep_ok) goto done;
+
+    rep_mark_clean(&set);
+    secs = rep_median_secs(&set);
+    seq = getenv("NITA_PREFILL_SEQ");
+    rep_print_runs(&set, n);
+    printf("\nprefill: %d tokens in %.3f s -> %.1f tok/s (%.2f ms/token) [%s]%s\n",
+           n, secs, secs > 0.0 ? (double)n / secs : 0.0,
+           secs > 0.0 ? 1000.0 * secs / (double)n : 0.0,
+           (seq && *seq && *seq != '0') ? "sequential" : "tiled",
+           set.reps > 1 ? " (median)" : "");
+    rep_report_excluded(&set);
+    rep_report_spread(&set, n);
+    rep_print_profile(&set);
+    rc = 0;
+done:
+    free(logits);
+    free(ids);
+    free(base);
+    nita_model_close(m);
+    return rc;
+}
+
+/* Measure steady-state decode throughput and dump the component profile.
+ * Single-token forwards only, with no per-token output, so the numbers
+ * reflect the engine rather than the terminal. */
+static int run_bench(const gguf_file_t *g, const tokenizer_t *tok, int n, int reps)
+{
+    char          err[256];
+    nita_model_t *m;
+    int32_t      *ids = NULL;
+    size_t        ntok = 0, i;
+    float        *logits;
+    int           nv;
+    clock_t       t0;
+    double        secs;
+    rep_set_t     set;
+    int           rep_i;
+
+    if (!tok || !tok->has_vocab) {
+        fprintf(stderr, "nita: model has no vocabulary; cannot tokenize\n");
+        return 1;
+    }
+    if (n <= 0) n = 8;
+
+    m = nita_model_open(g, n + 32, err, sizeof err);
+    if (!m) {
+        fprintf(stderr, "nita: %s\n", err);
+        return 1;
+    }
+
+    ids = tokenizer_encode(tok, "The quick brown fox jumps over the lazy dog.", &ntok);
+    if (!ids || ntok == 0) {
+        fprintf(stderr, "nita: tokenization produced no tokens\n");
+        nita_model_close(m);
+        return 1;
+    }
+
+    nv = nita_model_n_vocab(m);
+    logits = (float *)calloc((size_t)nv, sizeof(float));
+
+    /* One warm-up forward so first-touch page faults stay out of the window. */
+    if (nita_forward(m, ids[0], logits) != 0) {
+        fprintf(stderr, "nita: forward failed\n");
+        free(logits); free(ids); nita_model_close(m);
+        return 1;
+    }
+
+    rep_init(&set, reps);
+    for (rep_i = 0; rep_i < set.reps; ++rep_i) {
+        /* Each run starts from an empty cache so every rep walks the same
+         * positions: the second one must not be measuring a longer context. */
+        load_snap_t la, lb;
+
+        nita_model_reset(m);
+        nita_prof_reset();
+        load_snap(&la);
+        t0 = clock();
+        for (i = 0; i < (size_t)n; ++i) {
+            if (nita_forward(m, ids[i % ntok], logits) != 0) {
+                fprintf(stderr, "nita: forward failed at %zu\n", i);
+                free(logits); free(ids); nita_model_close(m);
+                return 1;
+            }
+        }
+        load_snap(&lb);
+        rep_record(&set, (double)(clock() - t0) / (double)CLOCKS_PER_SEC, &la, &lb);
+    }
+
+    rep_mark_clean(&set);
+    secs = rep_median_secs(&set);
+    rep_print_runs(&set, n);
+    printf("\nbench: %d forwards in %.3f s -> %.2f tok/s (%.1f ms/token)%s\n",
+           n, secs, secs > 0.0 ? (double)n / secs : 0.0,
+           secs > 0.0 ? 1000.0 * secs / (double)n : 0.0,
+           set.reps > 1 ? " (median)" : "");
+    rep_report_excluded(&set);
+    rep_report_spread(&set, n);
+    rep_print_profile(&set);
+
+    /* Sampling happens outside the forward pass, so it never appears in the
+     * component table above. Time it with the settings a caller actually
+     * uses, otherwise a slow sampler looks like free work. */
+    {
+        uint32_t rng = 12345u;
+        clock_t  s0;
+        double   ssecs;
+        int32_t  chosen = 0;
+        int      k;
+
+        for (k = 40; k >= 0; k -= 40) {
+            s0 = clock();
+            for (i = 0; i < (size_t)n; ++i)
+                chosen = nita_sample(logits, nv, 0.8f, k, &rng);
+            ssecs = (double)(clock() - s0) / (double)CLOCKS_PER_SEC;
+            printf("sample top_k=%-6d: %.2f ms/call (last id %d)\n",
+                   k, 1000.0 * ssecs / (double)n, (int)chosen);
+            fflush(stdout);
+        }
+    }
+
+    free(logits);
+    free(ids);
     nita_model_close(m);
     return 0;
 }
@@ -323,6 +873,9 @@ int main(int argc, char **argv)
     int         port = 7777;
     int         ctx = 2048;
     int         want_inspect = 0;
+    int         bench_n = 0;
+    int         prefill_n = 0;
+    int         reps_n = 5;
     int         i;
 
     for (i = 1; i < argc; ++i) {
@@ -347,6 +900,12 @@ int main(int argc, char **argv)
             quant_label = argv[++i];
         } else if (strcmp(a, "--inspect") == 0) {
             want_inspect = 1;
+        } else if (strcmp(a, "--bench") == 0 && i + 1 < argc) {
+            bench_n = atoi(argv[++i]);
+        } else if (strcmp(a, "--prefill") == 0 && i + 1 < argc) {
+            prefill_n = atoi(argv[++i]);
+        } else if (strcmp(a, "--reps") == 0 && i + 1 < argc) {
+            reps_n = atoi(argv[++i]);
         } else if (strcmp(a, "--logits") == 0 && i + 1 < argc) {
             logits_text = argv[++i];
         } else if (strcmp(a, "--tokens") == 0 && i + 1 < argc) {
@@ -414,6 +973,20 @@ int main(int argc, char **argv)
             tokenizer_free(tok);
             gguf_free(g);
             return 0;
+        }
+
+        if (bench_n > 0) {
+            int brc = run_bench(g, tok, bench_n, reps_n);
+            tokenizer_free(tok);
+            gguf_free(g);
+            return brc;
+        }
+
+        if (prefill_n != 0) {
+            int prc = run_prefill(g, tok, prefill_n, reps_n);
+            tokenizer_free(tok);
+            gguf_free(g);
+            return prc;
         }
 
         if (tokens_arg) {

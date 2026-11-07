@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "hadamard.h"
+
 #define NITA_VERSION "0.1.0"
 
 /* Opaque transformer handle, defined in transformer.c. */
@@ -338,6 +340,37 @@ int           nita_model_n_vocab(const nita_model_t *m);
  * n_vocab floats. Returns 0 on success. */
 int nita_forward(nita_model_t *m, int32_t token, float *logits);
 
+/* Evaluate a whole run of prompt tokens in one pass. Each weight row is
+ * dequantised once per tile instead of once per token, which is several times
+ * faster than calling nita_forward in a loop. The projections are bit-identical
+ * to the sequential path; the attention pass is vectorised end to end (q.k
+ * dots, softmax on the vector exp kernel, value mix) and so differs by float
+ * rounding only - measured max |dlogit| 1.1e-05 over a 128-token prompt, with
+ * no change to the argmax.
+ * The run must fit in the remaining context. logits, if non-NULL, receives the
+ * next-token distribution for the last token of the run. */
+int nita_prefill(nita_model_t *m, const int32_t *ids, int n, float *logits);
+
+/* Component profiler (transformer.c). Reset before a measured window and
+ * dump afterwards; both write to stdout. */
+void nita_prof_reset(void);
+void nita_prof_dump(void);
+
+/* One row of that profile. nita_prof_rows() hands the counters out so a caller
+ * can repeat a measurement and report the median of each component instead of
+ * trusting whichever single run it happened to get. "out-proj" is a subset of
+ * "projections", so a total must skip rows with subset set. */
+#define NITA_PROF_MAX_ROWS 16
+
+typedef struct {
+    const char *name;
+    double      us;
+    long        calls;
+    int         subset;
+} nita_prof_row_t;
+
+int  nita_prof_rows(nita_prof_row_t *out, int max_rows);
+
 /* Sample an id from logits using temperature and optional top-k. */
 int32_t nita_sample(const float *logits, int n_vocab,
                     float temperature, int top_k, uint32_t *rng);
@@ -348,6 +381,71 @@ int nita_generate(nita_model_t *m, const int32_t *prompt, size_t n_prompt,
                   int max_tokens, float temperature, int top_k, int32_t eos_id,
                   int32_t **out_ids, size_t *out_count, uint32_t seed,
                   bool *hit_limit);
+
+/* ================================================================== */
+/* qwen35 hybrid architecture – gated delta-net block (qwen35.c)       */
+/* ================================================================== */
+
+typedef struct {
+    int   n_embd;       /* embedding_length                        */
+    int   n_k_heads;    /* ssm.group_count                         */
+    int   head_k_dim;   /* ssm.state_size                          */
+    int   n_v_heads;    /* ssm.time_step_rank                      */
+    int   head_v_dim;   /* ssm.inner_size / ssm.time_step_rank     */
+    int   conv_kernel;  /* ssm.conv_kernel                         */
+    int   conv_dim;     /* 2*n_k_heads*head_k_dim + inner          */
+    float eps;          /* attention.layer_norm_rms_epsilon        */
+    int   layer;        /* set by the caller; only names dump lines */
+} q35_gdn_cfg_t;
+
+typedef struct {
+    nita_tensor_t in_norm;   /* attn_norm.weight           [n_embd]        */
+    nita_tensor_t qkv;       /* attn_qkv.weight            [ne, conv_dim]  */
+    nita_tensor_t gate;      /* attn_gate.weight           [ne, inner]     */
+    nita_tensor_t conv1d;    /* ssm_conv1d.weight          [k, conv_dim]   */
+    nita_tensor_t alpha;     /* ssm_alpha.weight           [ne, dt_rank]   */
+    nita_tensor_t beta;      /* ssm_beta.weight            [ne, dt_rank]   */
+    nita_tensor_t dt_bias;   /* ssm_dt.bias                [dt_rank]       */
+    nita_tensor_t ssm_a;     /* ssm_a                      [dt_rank]       */
+    nita_tensor_t ssm_norm;  /* ssm_norm.weight            [head_v_dim]    */
+    nita_tensor_t out;       /* ssm_out.weight             [inner, ne]     */
+    nita_tensor_t post_norm; /* post_attention_norm.weight [n_embd]        */
+
+    /* PrismML folds a Hadamard rotation into some matmuls, so the activation
+     * feeding them is rotated first (prism.hadamard.weight_names). NULL when
+     * the weight is not folded; rot_buf holds the rotated copy and is owned by
+     * the caller. alpha/beta are never folded. */
+    const nita_hadamard_t *rot_qkv;
+    const nita_hadamard_t *rot_gate;
+    const nita_hadamard_t *rot_out;
+    float                 *rot_buf;
+} q35_gdn_weights_t;
+
+typedef struct {
+    float *conv_state;   /* (conv_kernel-1) * conv_dim                */
+    float *delta;        /* n_v_heads * head_k_dim * head_v_dim       */
+    float *conv_w;       /* dequantised conv kernel, k * conv_dim     */
+    float *buf;          /* scratch                                   */
+    size_t buf_n;
+} q35_gdn_state_t;
+
+/* Validate the dimensions and allocate state. Dequantises the (tiny) conv
+ * kernel once. Returns 0 on success. */
+int  q35_gdn_prepare(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
+                     q35_gdn_state_t *s, char *err, size_t errlen);
+/* Zero the recurrent state so a new sequence starts fresh. */
+void q35_gdn_state_reset(const q35_gdn_cfg_t *c, q35_gdn_state_t *s);
+void q35_gdn_state_free(q35_gdn_state_t *s);
+
+/* Shared NITA_Q35_DUMP handle: one stream for the engine and the mixer, so
+ * writes from both cannot interleave into each other's buffer. NULL when the
+ * dump is off. */
+FILE *nita_q35_dump_file(void);
+
+/* Run the mixer for one token and add it to the residual stream:
+ * out = x + ssm_out(gated_rmsnorm(delta_rule(conv(qkv(norm(x)))))). */
+int  q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
+                   q35_gdn_state_t *s, const float *x, float *out);
 
 /* ================================================================== */
 /* HTTP server                                                         */

@@ -2,6 +2,17 @@ cmake_minimum_required(VERSION 3.20)
 project(NITA C)  # NITA = NC Inference Tool for All
 
 # ------------------------------------------------------------------
+# Default to an optimised build. "-march=..." alone leaves GCC at -O0,
+# which makes the scalar dequant/matvec kernels an order of magnitude
+# slower than they should be.
+# ------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+                 Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+# ------------------------------------------------------------------
 # Target architecture – AMD Zen3 AVX2 only
 # ------------------------------------------------------------------
 add_compile_options(-march=znver3 -mavx2)
@@ -93,7 +104,10 @@ add_executable(nita
     src/chat.c
     src/http.c
     src/dequant.c
+    src/quant.c
     src/transformer.c
+    src/qwen35.c
+    src/hadamard.c
     src/q4_matmul.c
 )
 

@@ -28,6 +28,8 @@ GGML_Q8_0 = 8
 GGML_Q1_0 = 41
 GGML_Q2_0 = 42
 GGML_PQ2_0 = 142
+GGML_TQ1_0 = 34
+GGML_TQ2_0 = 35
 GGML_PTQ1_0 = 143
 
 VOCAB = [
@@ -258,10 +260,125 @@ def dequantise_ptq1_0(data: bytes, n_elements: int) -> np.ndarray:
     return out
 
 
+def quantise_tq1_0(mat: np.ndarray) -> bytes:
+    """Encode as TQ1_0: 256-weight groups, dense base-3 trits.
+
+    Loop structure is upstream's quantize_row_tq1_0_ref: a 32-byte stage, then
+    a 16-byte stage, then four qh bytes at four trits each, scale last.
+    """
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0, "rows must be a multiple of 256 elements"
+    out = bytearray()
+    for start in range(0, flat.size, 256):
+        blk = flat[start:start + 256]
+        amax = float(np.max(np.abs(blk)))
+        inv = 1.0 / amax if amax > 0 else 0.0
+        tr = [max(0, min(2, int(np.rint(float(w) * inv)) + 1)) for w in blk]
+
+        qs = bytearray(48)
+        qh = bytearray(4)
+        x = 0
+        for c in (32, 16):
+            j = 0 if c == 32 else 32
+            for m in range(c):
+                byte = 0
+                for n in range(5):
+                    byte = byte * 3 + tr[x + n * c + m]
+                qs[j + m] = ((byte * 256 + 242) // 243) & 0xFF
+            x += 5 * c
+        for h in range(4):
+            byte = 0
+            for n in range(4):
+                byte = byte * 3 + tr[x + h + n * 4]
+            byte *= 3
+            qh[h] = ((byte * 256 + 242) // 243) & 0xFF
+
+        out += bytes(qs)
+        out += bytes(qh)
+        out += np.float16(amax).tobytes()
+    return bytes(out)
+
+
+def dequantise_tq1_0(data: bytes, n_elements: int) -> np.ndarray:
+    """Inverse of quantise_tq1_0."""
+    out = np.empty(n_elements, dtype=np.float32)
+    stages = (32, 16, 8)
+    for b in range(n_elements // 256):
+        base = b * 54
+        qs = data[base:base + 48]
+        qh = data[base + 48:base + 52]
+        d = float(np.frombuffer(data[base + 52:base + 54], dtype=np.float16)[0])
+
+        vals = []
+        j = 0
+        for c in stages:
+            while j + c <= 48:
+                for n in range(5):
+                    for m in range(c):
+                        q = (qs[j + m] * POW3[n]) & 0xFF
+                        xi = ((q * 3) & 0xFFFF) >> 8
+                        vals.append(float(xi - 1) * d)
+                j += c
+        for n in range(4):
+            for h in range(4):
+                q = (qh[h] * POW3[n]) & 0xFF
+                xi = ((q * 3) & 0xFFFF) >> 8
+                vals.append(float(xi - 1) * d)
+
+        out[b * 256:(b + 1) * 256] = vals
+    return out
+
+
+def quantise_tq2_0(mat: np.ndarray) -> bytes:
+    """Encode as TQ2_0: 256-weight groups, 2-bit slots, scale last.
+
+    Slot l is a bit plane over 32 stored bytes (upstream's "along 32 bytes"),
+    so it holds elements m + n*32 of each 128-element half.
+    """
+    flat = mat.reshape(-1)
+    assert flat.size % 256 == 0, "rows must be a multiple of 256 elements"
+    out = bytearray()
+    for start in range(0, flat.size, 256):
+        blk = flat[start:start + 256]
+        amax = float(np.max(np.abs(blk)))
+        inv = 1.0 / amax if amax > 0 else 0.0
+        tr = [max(0, min(2, int(np.rint(float(w) * inv)) + 1)) for w in blk]
+
+        qs = bytearray(64)
+        x = 0
+        for j in (0, 32):
+            for m in range(32):
+                q = 0
+                for n in range(4):
+                    q |= (tr[x + m + n * 32] & 3) << (2 * n)
+                qs[j + m] = q
+            x += 128
+
+        out += bytes(qs)
+        out += np.float16(amax).tobytes()
+    return bytes(out)
+
+
+def dequantise_tq2_0(data: bytes, n_elements: int) -> np.ndarray:
+    """Inverse of quantise_tq2_0."""
+    out = np.empty(n_elements, dtype=np.float32)
+    for b in range(n_elements // 256):
+        base = b * 66
+        qs = data[base:base + 64]
+        d = float(np.frombuffer(data[base + 64:base + 66], dtype=np.float16)[0])
+        vals = []
+        for g in (0, 1):
+            for l in range(4):
+                for m in range(32):
+                    vals.append(float(((qs[g * 32 + m] >> (2 * l)) & 3) - 1) * d)
+        out[b * 256:(b + 1) * 256] = vals
+    return out
+
+
 def build(dtype: str):
     rng = np.random.default_rng(20261106)
     scale = 0.08
-    ternary = dtype in ("ptq1_0", "pq2_0", "q2_0")
+    ternary = dtype in ("ptq1_0", "pq2_0", "q2_0", "tq1_0", "tq2_0")
     binary = dtype == "q1_0"
 
     def W(n_out, n_in):
@@ -296,7 +413,8 @@ def build(dtype: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out", nargs="?", default="tiny.gguf")
-    ap.add_argument("--dtype", choices=["f32", "q8_0", "q1_0", "q2_0", "pq2_0", "ptq1_0"],
+    ap.add_argument("--dtype", choices=["f32", "q8_0", "q1_0", "q2_0", "pq2_0",
+                                        "ptq1_0", "tq1_0", "tq2_0"],
                     default="f32")
     args = ap.parse_args()
 
@@ -334,6 +452,14 @@ def main():
             data = quantise_ptq1_0(mat)
             ttype = GGML_PTQ1_0
             effective[name] = dequantise_ptq1_0(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "tq1_0" and ne0_pad % 256 == 0:
+            data = quantise_tq1_0(mat)
+            ttype = GGML_TQ1_0
+            effective[name] = dequantise_tq1_0(data, mat.size).reshape(mat.shape)
+        elif args.dtype == "tq2_0" and ne0_pad % 256 == 0:
+            data = quantise_tq2_0(mat)
+            ttype = GGML_TQ2_0
+            effective[name] = dequantise_tq2_0(data, mat.size).reshape(mat.shape)
         else:
             data = np.ascontiguousarray(mat, dtype=np.float32).tobytes()
             ttype = GGML_F32
@@ -357,13 +483,13 @@ def main():
         kv_str("general.architecture", "llama"),
         kv_str("general.name", "nita-tiny"),
         kv_u32("general.alignment", ALIGNMENT),
-        kv_i32("llama.context_length", CTX),
-        kv_i32("llama.embedding_length", N_EMBD),
-        kv_i32("llama.block_count", N_LAYER),
-        kv_i32("llama.attention.head_count", N_HEAD),
-        kv_i32("llama.attention.head_count_kv", N_HEAD_KV),
-        kv_i32("llama.feed_forward_length", N_FF),
-        kv_i32("llama.rope.dimension_count", N_ROT),
+        kv_u32("llama.context_length", CTX),
+        kv_u32("llama.embedding_length", N_EMBD),
+        kv_u32("llama.block_count", N_LAYER),
+        kv_u32("llama.attention.head_count", N_HEAD),
+        kv_u32("llama.attention.head_count_kv", N_HEAD_KV),
+        kv_u32("llama.feed_forward_length", N_FF),
+        kv_u32("llama.rope.dimension_count", N_ROT),
         kv_f32("llama.attention.layer_norm_rms_epsilon", RMS_EPS),
         kv_f32("llama.rope.freq_base", ROPE_THETA),
         kv_arr_str("tokenizer.ggml.tokens", VOCAB),
