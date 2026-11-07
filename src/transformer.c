@@ -915,13 +915,18 @@ float *nita_thread_rowbuf(int thread)
 
 void nita_parallel_for(int n, nita_range_fn fn, void *ctx)
 {
+    nita_parallel_for_min(n, 64, fn, ctx);
+}
+
+void nita_parallel_for_min(int n, int min_items, nita_range_fn fn, void *ctx)
+{
     mt_pool_t *pool = g_pool;
     int        i;
 
     if (!fn || n <= 0) return;
 
     /* Small ranges lose more to the barrier than they save in parallelism. */
-    if (!pool || pool->n <= 1 || n < 64) {
+    if (!pool || pool->n <= 1 || n < min_items) {
         fn(ctx, 0, n, 0);
         return;
     }
@@ -1027,6 +1032,11 @@ static void att_dispatch(nita_model_t *m, int layer, int pos0, int ncol)
 static void pool_destroy(mt_pool_t *pool) { (void)pool; }
 void nita_parallel_for(int n, nita_range_fn fn, void *ctx)
 {
+    if (fn && n > 0) fn(ctx, 0, n, 0);
+}
+void nita_parallel_for_min(int n, int min_items, nita_range_fn fn, void *ctx)
+{
+    (void)min_items;
     if (fn && n > 0) fn(ctx, 0, n, 0);
 }
 float *nita_thread_rowbuf(int thread) { (void)thread; return NULL; }

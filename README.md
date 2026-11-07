@@ -860,20 +860,22 @@ override):
 
 | checkpoint | 1 thread | 4 | 8 | 16 |
 |---|---|---|---|---|
-| 2B | 172 ms/token | 60 | 43 | 45 |
-| 27B | 1.37 s/token | - | - | 0.31 s |
+| 2B | 173 ms/token | 54 | 36 | 38 |
+| 27B | 1.43 s/token | - | - | 0.26 s |
 
 Threads help to about eight; past that the SMT siblings cost as much in barrier
-wait as they return. Where a 27B token goes at 16 threads is again the qwen35
-mixer, but the mix has changed: the delta rule is now the largest single piece
-because it is the one part still serial (its heads are independent), then the
-conv, then the projections.
+wait as they return. The qwen35 mixer is still most of a Bonsai token, but its
+shape has changed twice now. First the three projections moved onto the integer
+kernels and the pool (55%, 19% and 18.5% of a token, all single-threaded,
+became single-digit); then the delta rule, which was 24.8% of the 2B once the
+projections were fast. Its value heads are independent - own input slices, own
+state matrix, own output slice - so they split across the pool with no locking
+and 4 heads is enough to be worth a barrier: 0.57 ms/layer to 0.076 ms.
 
 The pool exists on Windows only; elsewhere the same code runs one thread.
 Against llama.cpp, what is still missing is runtime ISA dispatch (the build
 hardcodes `-march=znver3 -mavx2`, so it faults on a CPU without AVX2), a pool on
-Linux and macOS, a backend seam for GPU work, and parallelism for the delta
-rule. The KV cache is
+Linux and macOS, and a backend seam for GPU work. The KV cache is
 `2 x n_layer x ctx x (n_head_kv * head_dim) x 4` bytes, so a 32-layer model
 with 4096-wide KV at 2048 context needs roughly 2 GB of cache.
 

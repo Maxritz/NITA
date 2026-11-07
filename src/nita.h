@@ -412,6 +412,10 @@ void nita_prof_mix(int part, double us);
  * nita_thread_rowbuf(), which is NULL when there is no pool. */
 typedef void (*nita_range_fn)(void *ctx, int lo, int hi, int thread);
 void   nita_parallel_for(int n, nita_range_fn fn, void *ctx);
+/* Same, with the caller deciding how small a range is worth a barrier: for work
+ * split into a few dozen chunky items (the mixer's value heads) the 64-item
+ * default would keep it serial. */
+void   nita_parallel_for_min(int n, int min_items, nita_range_fn fn, void *ctx);
 float *nita_thread_rowbuf(int thread);
 int    nita_thread_count(void);
 

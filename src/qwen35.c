@@ -299,6 +299,60 @@ void q35_gdn_state_free(q35_gdn_state_t *s)
 /* Forward                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Largest value-head width the delta rule accepts (a stack buffer per head). */
+#define Q35_MAX_HEAD_V 256
+
+typedef struct {
+    const float *q, *k, *v;      /* [nk*hk], [nk*hk], [nv*hv]                 */
+    float       *attn;           /* [nv*hv] output                            */
+    const float *g, *beta;       /* [nv] per-head decay and step size         */
+    float       *state;          /* [nv][hk][hv] delta-rule state             */
+    int          nk, hk, hv;
+    float        ascale;
+} gdn_job_t;
+
+static void gdn_heads(void *vctx, int lo, int hi, int thread)
+{
+    const gdn_job_t *j = (const gdn_job_t *)vctx;
+    int              h;
+
+    (void)thread;
+    for (h = lo; h < hi; ++h) {
+        int          kh  = nita_q35_k_head(h, j->nk);   /* see src/nita.h */
+        const float *qh  = j->q + (size_t)kh * (size_t)j->hk;
+        const float *khv = j->k + (size_t)kh * (size_t)j->hk;
+        const float *vh  = j->v + (size_t)h * (size_t)j->hv;
+        float       *S   = j->state + (size_t)h * (size_t)j->hk * (size_t)j->hv;
+        float       *oh  = j->attn + (size_t)h * (size_t)j->hv;
+        float        gv  = j->g[h];
+        float        bv  = j->beta[h];
+        int          i, d;
+        float        delta[Q35_MAX_HEAD_V];
+
+        /* delta = (v - g * S^T k) * beta, then the rank-1 state update. */
+        for (d = 0; d < j->hv; ++d) {
+            float acc = 0.0f;
+            for (i = 0; i < j->hk; ++i)
+                acc += S[(size_t)i * (size_t)j->hv + d] * khv[i];
+            delta[d] = (vh[d] - gv * acc) * bv;
+        }
+        for (i = 0; i < j->hk; ++i) {
+            float  ki = khv[i];
+            float *Sr = S + (size_t)i * (size_t)j->hv;
+            for (d = 0; d < j->hv; ++d) Sr[d] = gv * Sr[d] + ki * delta[d];
+        }
+        /* Output uses the updated state, scaled by 1/sqrt(head width) - the
+         * fused GDN kernel applies exactly this (gated_delta_net, scale =
+         * 1/sqrt(S_v)) before the gated norm. */
+        for (d = 0; d < j->hv; ++d) {
+            float acc = 0.0f;
+            for (i = 0; i < j->hk; ++i)
+                acc += S[(size_t)i * (size_t)j->hv + d] * qh[i];
+            oh[d] = acc * j->ascale;
+        }
+    }
+}
+
 int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
                   q35_gdn_state_t *s, const float *x, float *out)
 {
@@ -412,38 +466,28 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
 
     ascale = 1.0f / sqrtf((float)hv);
 
-    for (h = 0; h < nv; ++h) {
-        int         kh = nita_q35_k_head(h, nk);   /* see src/nita.h */
-        const float *qh = q + (size_t)kh * (size_t)hk;
-        const float *khv = k + (size_t)kh * (size_t)hk;
-        const float *vh = v + (size_t)h * (size_t)hv;
-        float       *S  = s->delta + (size_t)h * (size_t)hk * (size_t)hv;
-        float       *oh = attn + (size_t)h * (size_t)hv;
-        float        gv = g[h];
-        float        bv = beta[h];
-        float        delta[256];
+    /* (the per-head loop below runs through gdn_heads, defined above) */
 
-        if (hv > 256) return -6;
+    {
+        gdn_job_t jj;
 
-        /* delta = (v - g * S^T k) * beta, then the rank-1 state update. */
-        for (d = 0; d < hv; ++d) {
-            float acc = 0.0f;
-            for (i = 0; i < hk; ++i) acc += S[(size_t)i * (size_t)hv + d] * khv[i];
-            delta[d] = (vh[d] - gv * acc) * bv;
-        }
-        for (i = 0; i < hk; ++i) {
-            float ki = khv[i];
-            float *Sr = S + (size_t)i * (size_t)hv;
-            for (d = 0; d < hv; ++d) Sr[d] = gv * Sr[d] + ki * delta[d];
-        }
-        /* Output uses the updated state, scaled by 1/sqrt(head width) - the
-         * fused GDN kernel applies exactly this (gated_delta_net, scale =
-         * 1/sqrt(S_v)) before the gated norm. */
-        for (d = 0; d < hv; ++d) {
-            float acc = 0.0f;
-            for (i = 0; i < hk; ++i) acc += S[(size_t)i * (size_t)hv + d] * qh[i];
-            oh[d] = acc * ascale;
-        }
+        if (hv > Q35_MAX_HEAD_V) return -6;
+        jj.q      = q;
+        jj.k      = k;
+        jj.v      = v;
+        jj.attn   = attn;
+        jj.g      = g;
+        jj.beta   = beta;
+        jj.state  = s->delta;
+        jj.nk     = nk;
+        jj.hk     = hk;
+        jj.hv     = hv;
+        jj.ascale = ascale;
+        /* Heads are independent - own slice of every input, own state matrix,
+         * own output slice - so this splits with no locking, and 16 to 48
+         * heads is worth a barrier even though it is under the default.
+         * 4 heads is roughly where a split pays for itself. */
+        nita_parallel_for_min(nv, 4, gdn_heads, &jj);
     }
     Q35_PHASE(NITA_MIX_DELTA, t0);
     }
