@@ -162,11 +162,6 @@ static void l2norm_heads(float *v, int n_heads, int dim, float eps)
     }
 }
 
-static float silu_f(float x)
-{
-    return x / (1.0f + expf(-x));
-}
-
 /* Numerically stable softplus; expf overflows past ~88. */
 static float softplus_f(float x)
 {
@@ -365,7 +360,7 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
     int      cd    = c->conv_dim;
     int      kk    = c->conv_kernel;
     int      qdim  = nk * hk;
-    int      i, h, d, t;
+    int      i, h, t;
     float    ascale;
     const float *xin;
 
@@ -389,7 +384,7 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
 
     if (!s || !s->buf) return -1;
 
-#define Q35_CLOCK() ((double)clock() * 1e6 / (double)CLOCKS_PER_SEC)
+#define Q35_CLOCK() nita_prof_now()
 #define Q35_PHASE(part, t0) nita_prof_mix((part), Q35_CLOCK() - (t0))
     {
         double t0 = Q35_CLOCK();
@@ -414,12 +409,16 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
 
         for (t = 0; t < kk - 1; ++t)
             acc += kw[t] * hist[t];
-        cv[i] = silu_f(acc);
+        cv[i] = acc;
 
         /* Shift the window: drop the oldest, append the current sample. */
         for (t = 0; t < kk - 2; ++t) hist[t] = hist[t + 1];
         hist[kk - 2] = qkv[i];
     }
+
+    /* SiLU over the whole convolution at once: the per-channel call was a libm
+     * expf plus a divide, about 190 cycles each, for conv_dim values a layer. */
+    nita_silu_inplace(cv, cd);
     Q35_PHASE(NITA_MIX_CONV, t0);
     }
 
@@ -514,7 +513,7 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
             float *oh = attn + (size_t)h * (size_t)hv;
             float *gh = gate + (size_t)h * (size_t)hv;
             rmsnorm_w(oh, oh, norm_w, hv, 1e-6f);
-            for (d = 0; d < hv; ++d) oh[d] *= silu_f(gh[d]);
+            nita_silu_mul(oh, gh, oh, hv);
         }
     }
 

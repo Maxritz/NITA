@@ -404,6 +404,16 @@ enum {
 
 void nita_prof_mix(int part, double us);
 
+/* The profiler's clock, in microseconds, so a phase timer in another
+ * translation unit measures with the resolution the profile reports. */
+double nita_prof_now(void);
+
+/* x -> x*sigmoid(x) over a whole array, and dst[i] *= silu(src[i]), both on
+ * the engine's vector exp (transformer.c). The mixer used to call libm expf
+ * once per element, at roughly 190 cycles a call. */
+void nita_silu_inplace(float *v, int n);
+void nita_silu_mul(float *dst, const float *src, const float *u, int n);
+
 /* Run fn over [0, n) split across the engine's worker pool, one half-open row
  * range per participant; the calling thread takes the first slice.
  *   - every row must be independent, and fn must not recurse into this

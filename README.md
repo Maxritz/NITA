@@ -860,12 +860,12 @@ override):
 
 | checkpoint | 1 thread | 4 | 8 | 12 | 16 |
 |---|---|---|---|---|---|
-| 2B | 176 ms/token | 56 | 39 | - | 39 |
-| 27B | 1.16 s/token | 0.41 s | 0.25 s | 0.21 s | 0.22 s |
+| 2B | 169 ms/token | 50 | 31 | - | 31 |
+| 27B | 1.11 s/token | 0.36 s | 0.22 s | 0.18 s | 0.19 s |
 
 Threads help to about twelve on the 27B; past that the SMT siblings cost as
 much in barrier wait as they return. Twelve is where the row kernels stop being
-the limit: 3.8 GB per token over 0.21 s is 18 GB/s of the ~37 GB/s this machine
+the limit: 3.8 GB per token over 0.18 s is 21 GB/s of the ~37 GB/s this machine
 streams with a plain read loop, and the matvec rows alone account for 25 GB/s of
 that. The qwen35 mixer is still most of a Bonsai token, but its
 shape has changed twice now. First the three projections moved onto the integer
@@ -889,6 +889,22 @@ is why the 27B needs twelve threads to reach 18 GB/s. Two ideas measured worse
 and were dropped: independent trit planes in PTQ1_0 (more multiplies than the
 chain they replace, 2.5 -> 2.0 GB/s) and software prefetch in the Q1_0 loop
 (3.3 -> 2.9 GB/s; the hardware prefetcher already covers a sequential row).
+
+The mixer's own phases came next, and the profile could not see them: the phase
+timer used `clock()`, which the Windows CRT quantises to a millisecond, so a
+half-millisecond phase read as a whole one. `nita_prof_now()` is now
+QueryPerformanceCounter, exported so the mixer times with the same clock the
+profile reports. That put the two SiLU passes - the causal conv over `conv_dim`
+and the gated RMSNorm over `inner` - at 25.3 ms and 24.5 ms of a 204 ms token,
+because each element went through libm `expf` at roughly 190 cycles, about 790k
+calls a token. Both now run on the vector exp the prefill softmax already used,
+eight lanes at a time, exported as `nita_silu_inplace`/`nita_silu_mul` instead of
+a second copy of the polynomial: conv 25.3 -> 2.3 ms, gated-norm 24.5 -> 10.1 ms,
+27B token 204 -> 177 ms at twelve threads and 2B 39 -> 31 ms. (A first version
+of this wrote its own Cephes `exp` in qwen35.c; it measured the same and was
+folded back into the existing kernel.) What is left of a token is 142 ms of
+matvec at 25 GB/s plus 10 ms of delta-rule arithmetic that no thread count
+removes.
 
 The pool exists on Windows only; elsewhere the same code runs one thread.
 Against llama.cpp, what is still missing is runtime ISA dispatch (the build

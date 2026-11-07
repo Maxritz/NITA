@@ -63,9 +63,25 @@ static prof_t P_embed;   /* token embedding dequant                    */
 static prof_t P_ffnact;  /* silu * up                                  */
 static prof_t P_rope;
 
+double nita_prof_now(void)
+{
+#if defined(_WIN32)
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER        c;
+
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1e6 / (double)freq.QuadPart;
+#else
+    /* clock() is the portable fallback; it is coarse (1 ms on the Windows CRT),
+     * which is why the mixer phases used to read as whole milliseconds. */
+    return (double)clock() * 1e6 / (double)CLOCKS_PER_SEC;
+#endif
+}
+
 static double prof_now(void)
 {
-    return (double)clock() * 1e6 / (double)CLOCKS_PER_SEC;
+    return nita_prof_now();
 }
 
 static void prof_add(prof_t *p, double dt, long calls)
@@ -1265,6 +1281,30 @@ static void silu_mul(float *dst, const float *g, const float *u, int n)
     for (; i < n; ++i) dst[i] = silu(g[i]) * u[i];
 }
 
+void nita_silu_mul(float *dst, const float *g, const float *u, int n)
+{
+    silu_mul(dst, g, u, n);
+}
+
+/* The mixer needs the same kernel twice: SiLU in place over a convolution,
+ * and a gated multiply. Both go through vexp256 above so there is one vector
+ * exp in the engine rather than one per caller. */
+void nita_silu_inplace(float *v, int n)
+{
+    const __m256 one = _mm256_set1_ps(1.0f);
+    int i = 0;
+
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x = _mm256_loadu_ps(v + i);
+        const __m256 e = vexp256(_mm256_sub_ps(_mm256_setzero_ps(), x));
+
+        _mm256_storeu_ps(v + i,
+                         _mm256_mul_ps(x, _mm256_div_ps(
+                             one, _mm256_add_ps(one, e))));
+    }
+    for (; i < n; ++i) v[i] = silu(v[i]);
+}
+
 /* sum of exp((v[i]-bias)*scale) over n elements, eight lanes at a time. */
 static double exp_total(const float *v, int n, float bias, float scale)
 {
@@ -1285,6 +1325,20 @@ static double exp_total(const float *v, int n, float bias, float scale)
     return tot;
 }
 #else
+void nita_silu_inplace(float *v, int n)
+{
+    int i;
+
+    for (i = 0; i < n; ++i) v[i] = silu(v[i]);
+}
+
+void nita_silu_mul(float *dst, const float *g, const float *u, int n)
+{
+    int i;
+
+    for (i = 0; i < n; ++i) dst[i] = silu(g[i]) * u[i];
+}
+
 static void silu_mul(float *dst, const float *g, const float *u, int n)
 {
     int i;
