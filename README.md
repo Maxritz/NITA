@@ -142,8 +142,8 @@ were made for - on token `5,6,7`:
 The 27B (`Bonsai-27B-Q1_0.gguf`, 64 blocks, 5120 wide, 48 value heads) runs too:
 all 248320 logits at cosine **0.999961**, same argmax, mean absolute difference
 0.022, worst logit 0.16, and 493 tagged taps across every block between 0.9988
-and 1.00000. It needs 3.5 GiB resident and decodes at about 2.2 s per token with the default
-thread count, or 24 s per token on one thread.
+and 1.00000. It needs 3.5 GiB resident and decodes at about 0.31 s per token (3.2 tok/s) with
+the default thread count, or 1.37 s per token on one thread.
 
 That model found a second convention error, invisible on the 2B because it has
 as many value heads as key heads. A value head has to read key head
@@ -849,32 +849,31 @@ punctuation lands on its canonical ids: `,`→11, `!`→0).
 
 ## Performance and memory
 
-The forward pass is deliberately simple: rows are dequantised into a reusable
-buffer and dotted with the activation, split across a worker pool by output row.
-Row split, not column split, keeps every row's arithmetic identical to the
-single-threaded result, so turning threads up changes speed and not output.
+Quantised weights never reach float. The activation is quantised once per
+matvec (int8, per 32-element block) and dotted against the packed weights by the
+integer kernels in `quant.c`, split across a worker pool by output row. Row
+split, not column split, keeps every row's arithmetic identical to the
+single-threaded result, so turning threads up changes speed, not output.
 
 Measured here (32 logical cores, so 16 threads by default, `NITA_THREADS` to
 override):
 
-| checkpoint | 1 thread | 4 | 8 | 16 | gain |
-|---|---|---|---|---|---|
-| 2B | 527 ms/token | 155 | 95 | 83 | 6.3x |
-| 27B | 24.3 s/token | - | - | 2.16 s | 11.3x |
+| checkpoint | 1 thread | 4 | 8 | 16 |
+|---|---|---|---|---|
+| 2B | 172 ms/token | 60 | 43 | 45 |
+| 27B | 1.37 s/token | - | - | 0.31 s |
 
-The pool exists on Windows only; elsewhere the same code runs one thread. What
-costs the time on a Bonsai checkpoint is not the plain matmul: the qwen35
-mixer's three projections plus the delta rule were 95.6% of a token, measured
-before they used the pool. At 16 threads the 2B profile is 31.7% the mixer's
-qkv projection, 22.1% the outside-mixer projections, 14.4% the delta rule,
-12.5% the mixer's output projection, 11.9% its gated norm and 6.1% the conv.
-The delta rule is still single-threaded: its heads are independent and would
-split the same way, which is the next piece to take.
+Threads help to about eight; past that the SMT siblings cost as much in barrier
+wait as they return. Where a 27B token goes at 16 threads is again the qwen35
+mixer, but the mix has changed: the delta rule is now the largest single piece
+because it is the one part still serial (its heads are independent), then the
+conv, then the projections.
 
-Still missing against llama.cpp: fused quantised GEMV kernels (every row is
-expanded to float before the dot), runtime ISA dispatch (the build hardcodes
-`-march=znver3 -mavx2`, so it faults on a CPU without AVX2), a Linux/macOS
-pool, and a backend seam for GPU work. The KV cache is
+The pool exists on Windows only; elsewhere the same code runs one thread.
+Against llama.cpp, what is still missing is runtime ISA dispatch (the build
+hardcodes `-march=znver3 -mavx2`, so it faults on a CPU without AVX2), a pool on
+Linux and macOS, a backend seam for GPU work, and parallelism for the delta
+rule. The KV cache is
 `2 x n_layer x ctx x (n_head_kv * head_dim) x 4` bytes, so a 32-layer model
 with 4096-wide KV at 2048 context needs roughly 2 GB of cache.
 
