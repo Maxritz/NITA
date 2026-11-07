@@ -332,13 +332,7 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
     ascale = 1.0f / sqrtf((float)hv);
 
     for (h = 0; h < nv; ++h) {
-        /* Value head h reads key head h % nk, not h / (nv/nk): the fused GDN
-         * kernel indexes its q/k rows as `iv1 % neq1`, and the unfused path
-         * gets the same mapping from ggml_repeat, which tiles rather than
-         * blocks. The two agree only when every value head has its own key
-         * head, so a checkpoint with more v heads than k heads (Bonsai 27B:
-         * 48 v, 16 k) is the first place blocked indexing goes wrong. */
-        int         kh = h % nk;
+        int         kh = nita_q35_k_head(h, nk);   /* see src/nita.h */
         const float *qh = q + (size_t)kh * (size_t)hk;
         const float *khv = k + (size_t)kh * (size_t)hk;
         const float *vh = v + (size_t)h * (size_t)hv;

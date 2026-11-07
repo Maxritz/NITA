@@ -442,6 +442,22 @@ void q35_gdn_state_free(q35_gdn_state_t *s);
  * dump is off. */
 FILE *nita_q35_dump_file(void);
 
+/* Which key head the value head `h` of the delta rule reads.
+ *
+ * A value head owns a state matrix but not a query, and value heads can
+ * outnumber key heads (Bonsai 27B: 48 value heads over 16 key heads), so each
+ * value head has to pick one q/k vector. It reads key head `h % n_k_heads`:
+ * the fused GDN kernel indexes its q/k rows as `iv1 % neq1`, and the unfused
+ * path gets the same mapping from ggml_repeat, which tiles a tensor. Blocked
+ * indexing - `h / (n_v_heads / n_k_heads)` - reads just as plausibly and agrees
+ * exactly when the two counts are equal, so only a checkpoint with more value
+ * heads than key heads tells them apart. Bonsai 27B is such a checkpoint, and
+ * blocked indexing dropped its mixer output to cosine 0.81. */
+static inline int nita_q35_k_head(int h, int n_k_heads)
+{
+    return n_k_heads > 0 ? h % n_k_heads : h;
+}
+
 /* Run the mixer for one token and add it to the residual stream:
  * out = x + ssm_out(gated_rmsnorm(delta_rule(conv(qkv(norm(x)))))). */
 int  q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,

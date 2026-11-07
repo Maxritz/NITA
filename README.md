@@ -154,6 +154,16 @@ contiguous runs. With 48 v heads over 16 k heads the blocked reading pairs each
 value head with the wrong query, and the mixer output drops to cosine 0.81 while
 every input to it stays exact - which is what localised it.
 
+`tests/q35_heads_test.c` pins the convention, since no run of the 2B can:
+
+```
+gcc -I src tests/q35_heads_test.c -o build/q35_heads_test && build/q35_heads_test
+```
+
+It walks the 27B geometry (48 value heads over 16 key heads), checks that each
+key head feeds an equal share, and reports both readings' tables. Swapping the
+mapping back to blocked indexing makes it fail in 76 places.
+
 Getting there took one real bug, found by measurement rather than inspection.
 The delta-rule output must be scaled by `1/sqrt(head_v_dim)` before the gated
 norm (the fused GDN kernel does exactly this), and this engine omitted it. That
