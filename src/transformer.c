@@ -57,6 +57,7 @@ static prof_t P_out;     /* output projection, a subset of P_proj      */
 static prof_t P_pq, P_pk, P_pv, P_po, P_pg, P_pu, P_pd;
 static prof_t P_attn;    /* scores + softmax + context mix             */
 static prof_t P_mix;     /* qwen35 gated delta-net layer, whole        */
+static prof_t P_mixp[NITA_MIX_PARTS];   /* and its six phases              */
 static prof_t P_norm;    /* rmsnorm bodies                             */
 static prof_t P_embed;   /* token embedding dequant                    */
 static prof_t P_ffnact;  /* silu * up                                  */
@@ -73,6 +74,12 @@ static void prof_add(prof_t *p, double dt, long calls)
     p->calls += calls;
 }
 
+void nita_prof_mix(int part, double us)
+{
+    if (part < 0 || part >= NITA_MIX_PARTS) return;
+    prof_add(&P_mixp[part], us, 1);
+}
+
 void nita_prof_reset(void)
 {
     memset(&P_proj, 0, sizeof P_proj);   memset(&P_out, 0, sizeof P_out);
@@ -81,6 +88,7 @@ void nita_prof_reset(void)
     memset(&P_pg, 0, sizeof P_pg);  memset(&P_pu, 0, sizeof P_pu);
     memset(&P_pd, 0, sizeof P_pd);
     memset(&P_attn, 0, sizeof P_attn);   memset(&P_mix, 0, sizeof P_mix);
+    memset(P_mixp, 0, sizeof P_mixp);
     memset(&P_norm, 0, sizeof P_norm);
     memset(&P_embed, 0, sizeof P_embed); memset(&P_ffnact, 0, sizeof P_ffnact);
     memset(&P_rope, 0, sizeof P_rope);
@@ -91,13 +99,18 @@ int nita_prof_rows(nita_prof_row_t *out, int max_rows)
     static const char *names[]  = { "projections", "out-proj(sub)", "attention", "mixer",
                                     "norms", "ffn-activate", "rope", "embed",
                                     "  q-proj", "  k-proj", "  v-proj", "  o-proj",
-                                    "  ffn-gate", "  ffn-up", "  ffn-down" };
+                                    "  ffn-gate", "  ffn-up", "  ffn-down",
+                                    "  mix norm+qkv", "  mix conv", "  mix gates",
+                                    "  mix delta", "  mix gated-norm", "  mix out-proj" };
     static const int   subset[] = { 0, 1, 0, 0, 0, 0, 0, 0,
-                                    1, 1, 1, 1, 1, 1, 1 };
+                                    1, 1, 1, 1, 1, 1, 1,
+                                    1, 1, 1, 1, 1, 1 };
     const prof_t      *src[]    = { &P_proj, &P_out, &P_attn, &P_mix,
                                     &P_norm, &P_ffnact, &P_rope, &P_embed,
                                     &P_pq, &P_pk, &P_pv, &P_po,
-                                    &P_pg, &P_pu, &P_pd };
+                                    &P_pg, &P_pu, &P_pd,
+                                    &P_mixp[0], &P_mixp[1], &P_mixp[2],
+                                    &P_mixp[3], &P_mixp[4], &P_mixp[5] };
     const int          n = (int)(sizeof src / sizeof src[0]);
     int                i;
 
@@ -762,11 +775,19 @@ typedef struct mt_pool {
     int           att_layer;
     int           att_pos0;
     float        *rowbufs[NITA_MAX_THREADS];
+    /* kind 2: a generic range job published by nita_parallel_for */
+    nita_range_fn fn;
+    void         *fn_ctx;
     HANDLE        th[NITA_MAX_THREADS];
     HANDLE        ev[NITA_MAX_THREADS];
     mt_arg_t      args[NITA_MAX_THREADS];
 
 } mt_pool_t;
+
+/* The pool model_open builds, visible to code that has no model handle (the
+ * qwen35 mixer) but must run inside the same threads. Cleared when the model
+ * that owns it is freed. */
+static mt_pool_t *g_pool;
 
 static DWORD WINAPI mt_worker(LPVOID p)
 {
@@ -805,7 +826,9 @@ static DWORD WINAPI mt_worker(LPVOID p)
             uint64_t   lo = j.lo + total * (uint64_t)id / (uint64_t)pool->n;
             uint64_t   hi = j.lo + total * (uint64_t)(id + 1) / (uint64_t)pool->n;
 
-            if (pool->kind) {
+            if (pool->kind == 2) {
+                pool->fn(pool->fn_ctx, (int)lo, (int)hi, id);
+            } else if (pool->kind) {
                 attention_rows(pool->att_m, pool->att_layer, pool->att_pos0,
                                (int)lo, (int)hi);
             } else {
@@ -860,6 +883,7 @@ static void pool_destroy(mt_pool_t *pool)
 {
     int i;
     if (!pool) return;
+    if (g_pool == pool) g_pool = NULL;
 
     InterlockedExchange(&pool->have_job, 0);   /* no stale job may run */
     InterlockedExchange(&pool->shutdown, 1);
@@ -876,6 +900,46 @@ static void pool_destroy(mt_pool_t *pool)
         if (pool->ev[i]) CloseHandle(pool->ev[i]);
     for (i = 0; i < pool->n; ++i) free(pool->rowbufs[i]);
     free(pool);
+}
+
+int nita_thread_count(void)
+{
+    return g_pool ? g_pool->n : 1;
+}
+
+float *nita_thread_rowbuf(int thread)
+{
+    if (!g_pool || thread < 0 || thread >= g_pool->n) return NULL;
+    return g_pool->rowbufs[thread];
+}
+
+void nita_parallel_for(int n, nita_range_fn fn, void *ctx)
+{
+    mt_pool_t *pool = g_pool;
+    int        i;
+
+    if (!fn || n <= 0) return;
+
+    /* Small ranges lose more to the barrier than they save in parallelism. */
+    if (!pool || pool->n <= 1 || n < 64) {
+        fn(ctx, 0, n, 0);
+        return;
+    }
+
+    pool->completed = 0;
+    pool->kind   = 2;
+    pool->fn     = fn;
+    pool->fn_ctx = ctx;
+    pool->job.lo = 0;
+    pool->job.hi = (uint64_t)n;                /* published before the bump */
+    InterlockedExchange(&pool->have_job, 1);
+    InterlockedIncrement(&pool->gen);          /* full barrier: job visible */
+
+    for (i = 1; i < pool->n; ++i)
+        if (pool->waiting[i]) SetEvent(pool->ev[i]);
+
+    fn(ctx, 0, n / pool->n, 0);
+    while (pool->completed < pool->n - 1) NITA_PAUSE();
 }
 
 /* Split the row range across the pool; the calling thread takes slice 0. */
@@ -961,6 +1025,12 @@ static void att_dispatch(nita_model_t *m, int layer, int pos0, int ncol)
     attention_rows(m, layer, pos0, 0, ncol);
 }
 static void pool_destroy(mt_pool_t *pool) { (void)pool; }
+void nita_parallel_for(int n, nita_range_fn fn, void *ctx)
+{
+    if (fn && n > 0) fn(ctx, 0, n, 0);
+}
+float *nita_thread_rowbuf(int thread) { (void)thread; return NULL; }
+int    nita_thread_count(void) { return 1; }
 #endif
 
 /* Integer kernels are the default; NITA_INT8_DOT=0 restores the
@@ -1759,6 +1829,7 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
         if (env) { int v = atoi(env); if (v > 0) nt = v; }
         if (nt < 1) nt = 1;
         m->pool = pool_create(nt, m->rowcap);
+        g_pool  = (mt_pool_t *)m->pool;
     }
 #endif
 

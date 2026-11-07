@@ -30,32 +30,63 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /* Small kernels                                                       */
 /* ------------------------------------------------------------------ */
 
 /* y = W x with W stored row-major as ne1 rows of ne0 elements. */
+typedef struct {
+    const nita_tensor_t *t;
+    const float         *x;
+    float               *y;
+    size_t               row_bytes;
+    float               *row;      /* only the serial path uses this */
+    int                  rc;
+} mvrow_job_t;
+
+static void mvrow_rows(void *vctx, int lo, int hi, int thread)
+{
+    mvrow_job_t *j    = (mvrow_job_t *)vctx;
+    float       *row  = nita_thread_rowbuf(thread);
+    int          r;
+
+    if (!row) row = j->row;
+    if (!row) { j->rc = -3; return; }
+
+    for (r = lo; r < hi; ++r) {
+        const uint8_t *src = j->t->data + (size_t)r * j->row_bytes;
+        uint64_t       i;
+        float          sum = 0.0f;
+
+        if (nita_dequant_row(src, j->t->type, j->t->ne0, row) != 0) {
+            j->rc = -3;
+            return;
+        }
+        for (i = 0; i < j->t->ne0; ++i) sum += row[i] * j->x[i];
+        j->y[r] = sum;
+    }
+}
+
+/* Rows are independent, so splitting them across the pool gives the identical
+ * per-row arithmetic - the same sum in the same order - on every thread. */
 static int mv_row(const nita_tensor_t *t, const float *x, float *y,
                   int expect_in, int expect_out, float *row)
 {
-    size_t   row_bytes;
-    uint64_t r;
+    mvrow_job_t j;
 
     if (!t->bound) return -1;
     if ((int)t->ne0 != expect_in || (int)t->ne1 != expect_out) return -2;
 
-    row_bytes = nita_row_bytes(t->type, t->ne0);
-    for (r = 0; r < t->ne1; ++r) {
-        const uint8_t *src = t->data + (size_t)r * row_bytes;
-        uint64_t       i;
-        float          sum = 0.0f;
-
-        if (nita_dequant_row(src, t->type, t->ne0, row) != 0) return -3;
-        for (i = 0; i < t->ne0; ++i) sum += row[i] * x[i];
-        y[r] = sum;
-    }
-    return 0;
+    j.t         = t;
+    j.x         = x;
+    j.y         = y;
+    j.row_bytes = nita_row_bytes(t->type, t->ne0);
+    j.row       = row;
+    j.rc        = 0;
+    nita_parallel_for((int)t->ne1, mvrow_rows, &j);
+    return j.rc;
 }
 
 /* Dequantise a 1-D tensor into dst. */
@@ -274,14 +305,24 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
 
     if (!s || !s->buf) return -1;
 
-    /* ---- pre-mixer norm and the fused q/k/v projection ---- */
-    if (load_vec(&w->in_norm, row, ne) != 0) return -2;
-    rmsnorm_w(xh, x, row, ne, c->eps);
+#define Q35_CLOCK() ((double)clock() * 1e6 / (double)CLOCKS_PER_SEC)
+#define Q35_PHASE(part, t0) nita_prof_mix((part), Q35_CLOCK() - (t0))
+    {
+        double t0 = Q35_CLOCK();
 
-    xin = rot_in(w->rot_qkv, w->rot_buf, xh, ne);
-    if (mv_row(&w->qkv, xin, qkv, ne, cd, row) != 0) return -3;
+        /* ---- pre-mixer norm and the fused q/k/v projection ---- */
+        if (load_vec(&w->in_norm, row, ne) != 0) return -2;
+        rmsnorm_w(xh, x, row, ne, c->eps);
+
+        xin = rot_in(w->rot_qkv, w->rot_buf, xh, ne);
+        if (mv_row(&w->qkv, xin, qkv, ne, cd, row) != 0) return -3;
+        Q35_PHASE(NITA_MIX_NORM, t0);
+    }
 
     /* ---- causal depthwise conv, then SiLU ---- */
+    {
+    double t0 = Q35_CLOCK();
+
     for (i = 0; i < cd; ++i) {
         float *hist = s->conv_state + (size_t)i * (size_t)(kk - 1);
         const float *kw = s->conv_w + (size_t)i * (size_t)kk;
@@ -295,11 +336,16 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
         for (t = 0; t < kk - 2; ++t) hist[t] = hist[t + 1];
         hist[kk - 2] = qkv[i];
     }
+    Q35_PHASE(NITA_MIX_CONV, t0);
+    }
 
     dump_vec(c, "conv_output_silu", cv, cd);
     dump_vec(c, "v_conv_predelta", v, inner);
 
     /* ---- gates ---- */
+    {
+    double t0 = Q35_CLOCK();
+
     if (mv_row(&w->alpha, xh, alpha, ne, nv, row) != 0) return -4;
     if (mv_row(&w->beta,  xh, beta,  ne, nv, row) != 0) return -4;
 
@@ -321,8 +367,13 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
             beta[h] = 1.0f / (1.0f + expf(-beta[h]));
         }
     }
+    Q35_PHASE(NITA_MIX_GATES, t0);
+    }
 
     /* ---- delta rule, one 128x128 state matrix per value head ---- */
+    {
+    double t0 = Q35_CLOCK();
+
     l2norm_heads(q, nk, hk, 1e-6f);
     l2norm_heads(k, nk, hk, 1e-6f);
 
@@ -364,10 +415,15 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
             oh[d] = acc * ascale;
         }
     }
+    Q35_PHASE(NITA_MIX_DELTA, t0);
+    }
 
     dump_vec(c, "gdn_output", attn, inner);
 
     /* ---- gated RMSNorm over the value head width ---- */
+    {
+    double t0 = Q35_CLOCK();
+
     xin = rot_in(w->rot_gate, w->rot_buf, xh, ne);
     if (mv_row(&w->gate, xin, gate, ne, inner, row) != 0) return -7;
 
@@ -388,12 +444,23 @@ int q35_gdn_layer(const q35_gdn_cfg_t *c, const q35_gdn_weights_t *w,
         }
     }
 
+    Q35_PHASE(NITA_MIX_GATED_NORM, t0);
+    }
+
     dump_vec(c, "final_output", attn, inner);
 
     /* ---- output projection and residual ---- */
+    {
+    double t0 = Q35_CLOCK();
+
     xin = rot_in(w->rot_out, w->rot_buf, attn, inner);
     if (mv_row(&w->out, xin, proj, inner, ne, row) != 0) return -10;
     for (i = 0; i < ne; ++i) out[i] = x[i] + proj[i];
+    Q35_PHASE(NITA_MIX_OUT, t0);
+    }
+
+#undef Q35_PHASE
+#undef Q35_CLOCK
 
     return 0;
 }

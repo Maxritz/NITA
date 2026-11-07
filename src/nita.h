@@ -379,7 +379,7 @@ void nita_prof_dump(void);
  * can repeat a measurement and report the median of each component instead of
  * trusting whichever single run it happened to get. "out-proj" is a subset of
  * "projections", so a total must skip rows with subset set. */
-#define NITA_PROF_MAX_ROWS 16
+#define NITA_PROF_MAX_ROWS 24
 
 typedef struct {
     const char *name;
@@ -389,6 +389,31 @@ typedef struct {
 } nita_prof_row_t;
 
 int  nita_prof_rows(nita_prof_row_t *out, int max_rows);
+
+/* Sub-parts of the qwen35 mixer, so a profile can say where the time goes
+ * inside q35_gdn_layer instead of only what the whole layer costs. */
+enum {
+    NITA_MIX_NORM = 0,   /* pre-mixer rmsnorm + fused q/k/v projection */
+    NITA_MIX_CONV,       /* depthwise causal conv + SiLU               */
+    NITA_MIX_GATES,      /* alpha/beta projections and the decay/beta  */
+    NITA_MIX_DELTA,      /* L2 norms and the per-head delta rule       */
+    NITA_MIX_GATED_NORM, /* gate projection + gated RMSNorm            */
+    NITA_MIX_OUT,        /* output projection and residual add         */
+    NITA_MIX_PARTS
+};
+
+void nita_prof_mix(int part, double us);
+
+/* Run fn over [0, n) split across the engine's worker pool, one half-open row
+ * range per participant; the calling thread takes the first slice.
+ *   - every row must be independent, and fn must not recurse into this
+ *   - a range below 64 rows, or no pool, runs on the calling thread alone
+ * thread is a participant id in [0, nita_thread_count()); use it to index
+ * nita_thread_rowbuf(), which is NULL when there is no pool. */
+typedef void (*nita_range_fn)(void *ctx, int lo, int hi, int thread);
+void   nita_parallel_for(int n, nita_range_fn fn, void *ctx);
+float *nita_thread_rowbuf(int thread);
+int    nita_thread_count(void);
 
 /* Sample an id from logits using temperature and optional top-k. */
 int32_t nita_sample(const float *logits, int n_vocab,
