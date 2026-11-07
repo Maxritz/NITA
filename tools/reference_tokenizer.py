@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -152,7 +153,10 @@ def c_ids(exe, gguf, text):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exe", default="./nita.exe")
+    # Windows' CreateProcess does not accept a relative path that uses forward
+    # slashes, so "--exe build/nita.exe" failed with a bare WinError 2; abspath
+    # also rewrites the separators.
+    ap.add_argument("--exe", default="./nita.exe", type=os.path.abspath)
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--json", required=True)
     ap.add_argument("--text", action="append", default=[])

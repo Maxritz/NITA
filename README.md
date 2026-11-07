@@ -272,7 +272,38 @@ they run on every checkpoint configured - about a second each on the 27B:
 ctest --test-dir build -R 'hadamard|quant_dot'
 ```
 
-A bare `ctest --test-dir build` is both of those plus the rest in about ten
+A change to the GGUF reader (`src/gguf.c`) is checked by the independent reader
+first: it walks the header and tensor table with `struct` only and requires
+every tensor's declared block geometry to account for the file's data section
+exactly, so a wrong element count shows up as a byte gap rather than as
+plausible weights.
+
+```bash
+python3 tools/gguf_probe.py /path/to/model.gguf     # layout check: CONSISTENT
+```
+
+The checkpoint entries read the same tables through `src/gguf.c`, so they are
+the end-to-end check, and `nita --inspect` prints what the engine parsed for a
+line-by-line comparison. Be aware that `quant_dot` compares each integer kernel
+against the row *this engine* dequantised, so it catches a kernel error but not
+a mis-read offset, which moves both sides together - that is `gguf_probe.py`.
+
+The tokenizer is not in CTest; it is checked against an independent Python
+implementation of both encoders on a generated vocabulary, which covers the
+merges list, the score ordering and the byte fallback (see *Tokenizer* for what
+that established):
+
+```bash
+python3 tools/make_tokenizer_gguf.py build
+python3 tools/reference_tokenizer.py --gguf build/tok_spm.gguf \
+        --json build/tok_spm.gguf.json --exe build/nita.exe
+python3 tools/reference_tokenizer.py --gguf build/tok_bpe.gguf \
+        --json build/tok_bpe.gguf.json --exe build/nita.exe
+```
+
+Both print a PASS or FAIL per text and exit non-zero on a mismatch.
+
+A bare `ctest --test-dir build` runs everything CTest knows about in about ten
 seconds, which is usually the right default; see *Tests* for the one entry that
 needs `-DNITA_TEST_SLOW=ON`.
 
