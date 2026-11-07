@@ -270,6 +270,17 @@ target_link_libraries(quant_dot_test PRIVATE nita_core)
 set(NITA_FORK_LOGITS "" CACHE FILEPATH
     "logits driver linked against the PrismML fork; empty to use fork_logits")
 
+# A full fork comparison costs roughly the whole forward pass on both sides:
+# four seconds on the 2B but 82 on the 27B, which is long enough to put a plain
+# `ctest` off a quick loop. So on a checkpoint over a gigabyte it is registered
+# only with -DNITA_TEST_SLOW=ON; every other entry stays, since q35_probe and
+# quant_dot on the 27B take about a second each and are the only cover the
+# Q1_0 path gets. The configure step names anything it deferred, so the fast
+# run is never quietly the whole story.
+set(NITA_TEST_SLOW OFF CACHE BOOL
+    "Register fork_match on checkpoints over 1 GiB too (adds about 80 s)")
+set(_nita_slow_bytes 1073741824)
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
 # A driver named by hand wins over the one built here, so a checkout that lives
@@ -295,6 +306,13 @@ foreach(_model ${NITA_TEST_MODELS})
     endwhile()
     list(APPEND _registered_tags "${_tag}")
 
+    file(SIZE "${_model}" _model_bytes)
+    if(_model_bytes GREATER _nita_slow_bytes)
+        set(_model_slow ON)
+    else()
+        set(_model_slow OFF)
+    endif()
+
     add_test(NAME q35_probe@${_tag} COMMAND q35_probe "${_model}")
     # --all walks the tensor table and tests every quantised type the file
     # stores, so this entry does not have to name a type id that could drift.
@@ -303,15 +321,25 @@ foreach(_model ${NITA_TEST_MODELS})
                          PROPERTIES LABELS "checkpoint")
 
     if(_fork_test_driver AND Python3_Interpreter_FOUND)
-        add_test(NAME fork_match@${_tag}
-                 COMMAND ${Python3_EXECUTABLE}
-                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fork_match.py
-                         --engine $<TARGET_FILE:nita>
-                         --fork ${_fork_test_driver}
-                         --model "${_model}")
-        set_tests_properties(fork_match@${_tag}
-                             PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77
-                                        LABELS "checkpoint")
+        if(_model_slow AND NOT NITA_TEST_SLOW)
+            message(STATUS
+                "checkpoint tests: fork_match@${_tag} deferred (large file, "
+                "add -DNITA_TEST_SLOW=ON to register it)")
+        else()
+            add_test(NAME fork_match@${_tag}
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fork_match.py
+                             --engine $<TARGET_FILE:nita>
+                             --fork ${_fork_test_driver}
+                             --model "${_model}")
+            set_tests_properties(fork_match@${_tag}
+                                 PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77
+                                            LABELS "checkpoint")
+            if(_model_slow)
+                set_tests_properties(fork_match@${_tag}
+                                     PROPERTIES LABELS "checkpoint;slow")
+            endif()
+        endif()
     endif()
 endforeach()
 if(NOT _registered_tags)

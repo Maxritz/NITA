@@ -269,6 +269,7 @@ Produces `nita` (plus a `minimal_engine` compatibility copy).
 | `-DDEBUG_BREADCRUMBS=ON` | Breadcrumb markers on stderr |
 | `-DNITA_FORK_DIR=<dir>` | PrismML checkout with `build-mingw` (default `build/prism-llama`) |
 | `-DNITA_FORK_LOGITS=<exe>` | Use this fork driver instead of the built one |
+| `-DNITA_TEST_SLOW=ON` | Also register `fork_match` on checkpoints over 1 GiB (about 80 s) |
 
 Exactly one quantisation flag should be enabled; the build derives
 `QUANT_TYPE` from it. The transformer itself reads the per-tensor types
@@ -306,16 +307,29 @@ A path that does not exist is reported and skipped rather than registered as a
 failure, so the same configure works on a machine that holds only one of them,
 and `-DNITA_TEST_MODEL=<one path>` still sets the list to that single entry.
 Because CTest matches names as substrings, `ctest -R fork_match` still selects
-every checkpoint's comparison; `ctest -L checkpoint` selects the six entries
-that need a model.
+every checkpoint's comparison; `ctest -L checkpoint` selects every entry that
+needs a model.
+
+A full fork comparison costs about a whole forward pass on both sides - four
+seconds on the 2B, but 82 on the 27B - so on a checkpoint over a gigabyte
+`fork_match` is held back unless the build says to include it:
+
+```bash
+cmake -S . -B build -DNITA_TEST_SLOW=ON    # + fork_match on the 27B, labelled slow
+```
+
+That keeps a plain `ctest` around ten seconds on both checkpoints, since the
+27B's `q35_probe` and `quant_dot` are about a second each and are the only
+cover its `Q1_0` quantisation gets; configure prints which entry it deferred,
+and `-L slow` runs exactly the deferred ones once they exist.
 
 `fork_match` is the logits check against the reference runtime, with no
 by-hand steps: it runs both binaries on tokens `5,6,7`, dumps every tagged
 tensor, and fails on any of four conditions - logits cosine under 0.9999, a
 different argmax, a different top-5 set, or any tap under 0.995. On the 2B it
 reports cosine 0.999989 over all 248320 logits with 187 taps compared, worst
-0.999784, in about six seconds; the 27B takes about a minute and a half and
-lands at 0.999961 with 497 taps. The entry is registered only when the fork
+0.999784, in about six seconds; the 27B takes about a minute and a half (with
+`-DNITA_TEST_SLOW=ON`) and lands at 0.999961 with 497 taps. The entry is registered only when the fork
 driver exists - `fork_logits`, built here when the PrismML checkout has been
 built (see *The reference harness*), or whatever `-DNITA_FORK_LOGITS` names -
 and if the binary later goes missing the script exits 77 and CTest calls it a
