@@ -56,6 +56,7 @@ static prof_t P_out;     /* output projection, a subset of P_proj      */
  * assume it. All are subsets of P_proj. */
 static prof_t P_pq, P_pk, P_pv, P_po, P_pg, P_pu, P_pd;
 static prof_t P_attn;    /* scores + softmax + context mix             */
+static prof_t P_mix;     /* qwen35 gated delta-net layer, whole        */
 static prof_t P_norm;    /* rmsnorm bodies                             */
 static prof_t P_embed;   /* token embedding dequant                    */
 static prof_t P_ffnact;  /* silu * up                                  */
@@ -79,21 +80,22 @@ void nita_prof_reset(void)
     memset(&P_pv, 0, sizeof P_pv);  memset(&P_po, 0, sizeof P_po);
     memset(&P_pg, 0, sizeof P_pg);  memset(&P_pu, 0, sizeof P_pu);
     memset(&P_pd, 0, sizeof P_pd);
-    memset(&P_attn, 0, sizeof P_attn);   memset(&P_norm, 0, sizeof P_norm);
+    memset(&P_attn, 0, sizeof P_attn);   memset(&P_mix, 0, sizeof P_mix);
+    memset(&P_norm, 0, sizeof P_norm);
     memset(&P_embed, 0, sizeof P_embed); memset(&P_ffnact, 0, sizeof P_ffnact);
     memset(&P_rope, 0, sizeof P_rope);
 }
 
 int nita_prof_rows(nita_prof_row_t *out, int max_rows)
 {
-    static const char *names[]  = { "projections", "out-proj(sub)", "attention", "norms",
-                                    "ffn-activate", "rope", "embed",
+    static const char *names[]  = { "projections", "out-proj(sub)", "attention", "mixer",
+                                    "norms", "ffn-activate", "rope", "embed",
                                     "  q-proj", "  k-proj", "  v-proj", "  o-proj",
                                     "  ffn-gate", "  ffn-up", "  ffn-down" };
-    static const int   subset[] = { 0, 1, 0, 0, 0, 0, 0,
+    static const int   subset[] = { 0, 1, 0, 0, 0, 0, 0, 0,
                                     1, 1, 1, 1, 1, 1, 1 };
-    const prof_t      *src[]    = { &P_proj, &P_out, &P_attn, &P_norm,
-                                    &P_ffnact, &P_rope, &P_embed,
+    const prof_t      *src[]    = { &P_proj, &P_out, &P_attn, &P_mix,
+                                    &P_norm, &P_ffnact, &P_rope, &P_embed,
                                     &P_pq, &P_pk, &P_pv, &P_po,
                                     &P_pg, &P_pu, &P_pd };
     const int          n = (int)(sizeof src / sizeof src[0]);
@@ -2135,11 +2137,13 @@ static int q35_forward(nita_model_t *m, int32_t token, float *logits)
 
         if (m->layer_recr[l]) {
             /* The mixer normalises, mixes and adds its own residual. */
-            int rc;
+            double t0 = prof_now();
+            int    rc;
 
             m->q35_cfg.layer = l;
             rc = q35_gdn_layer(&m->q35_cfg, &m->q35_w[l], &m->q35_state[l],
                                m->xb, m->xb);
+            prof_add(&P_mix, prof_now() - t0, 1);
             if (rc != 0) {
                 fprintf(stderr, "qwen35: delta-net mixer returned %d on layer %d\n", rc, l);
                 return -20;
