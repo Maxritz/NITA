@@ -278,9 +278,13 @@ tensor table with `struct` alone and requires every tensor's declared block
 geometry to account for the file's data section exactly, so a wrong element
 count is a byte gap rather than plausible weights. With `--engine` it also
 compares its own parse against the engine's, since a probe that never ran engine
-code could not see a reader regression by itself - the four header facts plus
-every tensor's name, type, dims and offset, which is what `nita --tensor-table`
-prints (all 320 and 851 of them agree today):
+code could not see a reader regression by itself. `nita --tensor-table` prints
+the four header facts, every tensor's name, type, dims and offset, and where the
+bound pointer actually lands with a hash of the first 64 bytes it leads to. That
+last pair is what catches a pointer into the wrong place: a header can parse
+perfectly and still hand the forward pass bytes from elsewhere - a data offset
+aligned with the wrong rule, say, or a 64-bit offset truncated on a 3.8 GB file.
+All 320 and 851 tensors agree today:
 
 ```bash
 python3 tools/gguf_probe.py --engine build/nita.exe /path/to/model.gguf
@@ -379,12 +383,18 @@ needs a model, `-L tokenizer` the three that do not.
 with Python's `struct` and checks that the declared block geometry of every
 tensor type accounts for the data section, then compares its parse against
 `nita --tensor-table` field by field: version, tensor count, metadata key count,
-data offset, and every tensor's name, type, dims and offset. The layout half is
-an independent model of the file rather than engine code, which is why the
-engine half is there too - together they fail on a reader that mis-reads one
-entry as readily as one that mis-reads the file, and a difference names the
-tensor and both values instead of only moving the logits later. The 27B gets
-both passes in 1.3 s even when its `fork_match` is deferred.
+data offset, and every tensor's name, type, dims and offset. It also hashes the
+first 64 bytes at each bound pointer and checks that against the same 64 bytes
+read from the position its own parse puts them, so a pointer that lands
+somewhere else fails even though every header field matched. The pointers come
+from `nita_bind_all`, the bounds-checked path that binds the weights for the
+forward pass, not a second copy of the arithmetic. The layout half is an
+independent model of the file rather than engine code, which is why the engine
+half is there too - together they fail on a reader that mis-reads one entry as
+readily as one that mis-reads the file or points at the wrong bytes, and a
+difference names the tensor and both values instead of only moving the logits
+later. The 27B gets both passes in about 1.3 s even when its `fork_match` is
+deferred.
 
 `tokenizer@spm` and `tokenizer@bpe` run the engine on the synthetic vocabulary
 `tokenizer_vocab` writes into the build directory; that entry is a setup fixture
@@ -439,7 +449,8 @@ tensors respectively, with no tensor over the 1e-2 tolerance.
 --quant-type <name> label reported for the compiled kernel
 --inspect           print model metadata and tensor table, then exit
 --tensor-table      print the header facts and every tensor as tab-separated
-                    name, type, dims and offset (for gguf_probe.py --engine)
+                    name, type, dims, offset, bound pointer and a hash of the
+                    bytes there (for gguf_probe.py --engine)
 --logits <text>     tokenize text, run the forward pass, print logits
 --tokens <a,b,c>    run the forward pass on explicit token ids
 --prefill <n>       measure prompt processing: n tokens evaluated in one

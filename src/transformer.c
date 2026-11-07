@@ -307,6 +307,19 @@ static bool bind_tensor(const gguf_file_t *g, nita_tensor_t *t, const char *name
     return false;
 }
 
+int nita_bind_all(const gguf_file_t *g, nita_tensor_t *out, size_t cap)
+{
+    uint64_t i;
+
+    if (!g || !out) return -1;
+    if (g->tensor_count > (uint64_t)cap) return -1;
+
+    for (i = 0; i < g->tensor_count; ++i)
+        if (!bind_tensor(g, &out[i], g->tensors[i].name)) return -1;
+
+    return (int)g->tensor_count;
+}
+
 /* Read a hyperparameter, trying the model's own architecture prefix first. */
 static int64_t hparam_int(const gguf_file_t *g, const char *arch, const char *suffix,
                           int64_t fallback)

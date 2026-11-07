@@ -327,6 +327,12 @@ typedef struct {
     bool           bound;
 } nita_tensor_t;
 
+/* Bind every tensor in the file through the path the forward pass uses, in file
+ * order, so a caller can check where those pointers land. Returns the number
+ * bound, or -1 when a tensor fails the bounds check bind_tensor applies - which
+ * is the answer a caller about to read bytes through them wants. */
+int nita_bind_all(const gguf_file_t *g, nita_tensor_t *out, size_t cap);
+
 /* Build the engine from a parsed GGUF file. Returns NULL and fills err when
  * the file is not a supported llama-style transformer. */
 nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t errlen);

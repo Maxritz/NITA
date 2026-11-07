@@ -85,6 +85,14 @@ class Reader:
 
 
 HEADER_FIELDS = ("version", "tensors", "keys", "data_offset")
+CHECK_BYTES = 64
+
+
+def fnv1a64(buf):
+    h = 0xcbf29ce484222325
+    for b in buf:
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
 
 
 def engine_table(exe, path):
@@ -100,9 +108,10 @@ def engine_table(exe, path):
         fields = line.split("\t")
         if len(fields) == 2 and fields[0] in HEADER_FIELDS:
             header[fields[0]] = int(fields[1])
-        elif len(fields) == 4:
+        elif len(fields) == 6:
             dims = tuple(int(x) for x in fields[2].split(",") if x)
-            rows.append((fields[0], int(fields[1]), dims, int(fields[3])))
+            rows.append((fields[0], int(fields[1]), dims, int(fields[3]),
+                         int(fields[4]), int(fields[5], 16)))
 
     missing = [f for f in HEADER_FIELDS if f not in header]
     if missing:
@@ -218,14 +227,27 @@ def main():
                     for k in HEADER_FIELDS if hdr[k] != want_hdr[k]]
         if len(rows) != len(tensors):
             problems.append(f"tensor count: engine {len(rows)} != file {len(tensors)}")
-        for i, (file_row, engine_row) in enumerate(zip(tensors, rows)):
-            name, dims, ttype, offset = file_row
-            if engine_row != (name, ttype, tuple(dims), offset):
-                problems.append(f"{name or f'tensor #{i}'}: engine {engine_row} "
-                                f"!= file {(name, ttype, tuple(dims), offset)}")
-            if len(problems) > 5:
-                problems.append("... further differences not listed")
-                break
+        with open(path, "rb") as weights:
+            for i, (file_row, engine_row) in enumerate(zip(tensors, rows)):
+                name, dims, ttype, offset = file_row
+                e_name, e_type, e_dims, e_offset, e_abs, e_hash = engine_row
+                label = name or f"tensor #{i}"
+                want = (name, ttype, tuple(dims), offset)
+                got = (e_name, e_type, e_dims, e_offset)
+                if got != want:
+                    problems.append(f"{label}: engine {got} != file {want}")
+                elif e_abs != data_offset + offset:
+                    problems.append(f"{label}: engine reads at {e_abs}, the "
+                                    f"header puts it at {data_offset + offset}")
+                else:
+                    weights.seek(e_abs)
+                    n = min(CHECK_BYTES, file_size - e_abs)
+                    if fnv1a64(weights.read(n)) != e_hash:
+                        problems.append(f"{label}: the bytes at {e_abs} are not "
+                                        f"what the engine hashed ({e_hash:016x})")
+                if len(problems) > 5:
+                    problems.append("... further differences not listed")
+                    break
 
         if problems:
             print(f"engine table    : DISAGREE ({len(problems)})")
@@ -234,7 +256,7 @@ def main():
             ok = False
         else:
             print(f"engine table    : AGREE ({len(rows)} tensors, "
-                  f"name/type/dims/offset and header)")
+                  f"name/type/dims/offset, pointer and bytes, and header)")
     return 0 if ok else 1
 
 

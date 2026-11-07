@@ -71,7 +71,8 @@ static void print_usage(FILE *f, const char *argv0)
         "  --name <id>         model id served by /v1/models (default: file stem)\n"
         "  --quant-type <name> label to report for the compiled kernel\n"
         "  --inspect           print model metadata and exit\n"
-        "  --tensor-table      print the tensor table as tab-separated fields\n"
+        "  --tensor-table      print every tensor's name, type, dims, offsets\n"
+        "                      and a hash of its first bytes, tab-separated\n"
         "  --tokenize <text>   print token ids and decode round-trip, then exit\n"
         "                      (\"-\" reads the text from stdin)\n"
         "  --logits <text>     run the forward pass on text, print logits\n"
@@ -807,28 +808,74 @@ static int run_logits(const gguf_file_t *g, const tokenizer_t *tok, const char *
     return 0;
 }
 
-/* One tensor per line: name, type id, dims, offset - the fields the GGUF
- * reader produces and the ones an independent parse can be held against. The
- * human-readable --inspect listing stops at 40 tensors and omits offsets, so a
- * mis-read entry in the middle of a 851-tensor file would not show up there. */
-static void tensor_table(const gguf_file_t *g)
+#define TENSOR_CHECK_BYTES 64
+
+static uint64_t fnv1a64(const uint8_t *p, size_t n)
 {
-    uint64_t i;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    size_t   i;
+
+    for (i = 0; i < n; ++i) {
+        h ^= (uint64_t)p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* One tensor per line: name, type id, dims, offset from the header, the absolute
+ * file offset the forward pass will read it at, and a hash of the bytes that
+ * pointer leads to. The human-readable --inspect listing stops at 40 tensors and
+ * omits offsets, so a mis-read entry in the middle of a 851-tensor file would
+ * not show up there, and an offset that parses correctly but points somewhere
+ * else only shows up as wrong logits.
+ *
+ * The pointers come from nita_bind_all, i.e. the same bounds-checked path that
+ * binds the weights for the forward pass, not a second copy of the arithmetic.
+ * That is what makes the hash a statement about the weights. */
+static int tensor_table(const gguf_file_t *g)
+{
+    nita_tensor_t *bound = NULL;
+    uint64_t       i;
+    int            nb = 0;
 
     printf("version\t%u\n", g->version);
     printf("tensors\t%llu\n", (unsigned long long)g->tensor_count);
     printf("keys\t%llu\n", (unsigned long long)g->kv_count);
     printf("data_offset\t%llu\n", (unsigned long long)g->data_offset);
 
+    if (g->tensor_count) {
+        bound = (nita_tensor_t *)calloc((size_t)g->tensor_count, sizeof *bound);
+        if (!bound) {
+            fprintf(stderr, "out of memory for %llu bindings\n",
+                    (unsigned long long)g->tensor_count);
+            return 1;
+        }
+        nb = nita_bind_all(g, bound, (size_t)g->tensor_count);
+        if (nb != (int)g->tensor_count) {
+            fprintf(stderr, "binding failed: a tensor does not fit in the file\n");
+            free(bound);
+            return 1;
+        }
+    }
+
     for (i = 0; i < g->tensor_count; ++i) {
         const gguf_tensor_t *t = &g->tensors[i];
+        uint64_t             abs_off = (uint64_t)(bound[i].data - g->data);
+        size_t               n = g->file_size - abs_off < TENSOR_CHECK_BYTES
+                                 ? (size_t)(g->file_size - abs_off)
+                                 : TENSOR_CHECK_BYTES;
         uint32_t             d;
 
         printf("%s\t%u\t", t->name, (unsigned)t->type);
         for (d = 0; d < t->n_dims; ++d)
             printf("%s%llu", d ? "," : "", (unsigned long long)t->dims[d]);
-        printf("\t%llu\n", (unsigned long long)t->offset);
+        printf("\t%llu\t%llu\t%016llx\n", (unsigned long long)t->offset,
+               (unsigned long long)abs_off,
+               (unsigned long long)fnv1a64(bound[i].data, n));
     }
+
+    free(bound);
+    return 0;
 }
 
 static void inspect(const gguf_file_t *g, const tokenizer_t *tok)
@@ -999,10 +1046,10 @@ int main(int argc, char **argv)
         }
 
         if (want_tensor_table) {
-            tensor_table(g);
+            int trc = tensor_table(g);
             tokenizer_free(tok);
             gguf_free(g);
-            return 0;
+            return trc;
         }
 
         if (want_inspect) {
