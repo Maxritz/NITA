@@ -798,6 +798,15 @@ typedef struct mt_pool {
     HANDLE        ev[NITA_MAX_THREADS];
     mt_arg_t      args[NITA_MAX_THREADS];
 
+    /* Matvec rows are claimed in blocks rather than split once up front: a
+     * participant that falls behind (memory latency, a preempted thread, a
+     * slower CCD) stops being the critical path, because the others keep
+     * taking blocks. Only assignment changes - every row is still reduced in
+     * its own order - so results stay bit-identical to the fixed split. */
+    volatile LONG row_next;
+    volatile LONG row_end;
+    volatile LONG row_step;
+
 } mt_pool_t;
 
 /* The pool model_open builds, visible to code that has no model handle (the
@@ -836,7 +845,22 @@ static DWORD WINAPI mt_worker(LPVOID p)
          * master has invalidated: its buffers may already be freed. */
         if (pool->shutdown || !pool->have_job) continue;
 
-        {
+        if (pool->kind == 0 && pool->row_step > 0) {
+            mv_range_t j = pool->job;
+
+            j.rowbuf = pool->rowbufs[id];
+            for (;;) {
+                LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+                LONG hi;
+
+                if (lo >= pool->row_end) break;
+                hi = lo + pool->row_step;
+                if (hi > pool->row_end) hi = pool->row_end;
+                j.lo = (uint64_t)lo;
+                j.hi = (uint64_t)hi;
+                mv_rows(&j);
+            }
+        } else {
             mv_range_t j = pool->job;
             uint64_t   total = j.hi - j.lo;
             uint64_t   lo = j.lo + total * (uint64_t)id / (uint64_t)pool->n;
@@ -856,6 +880,18 @@ static DWORD WINAPI mt_worker(LPVOID p)
         }
         InterlockedIncrement(&pool->completed);
     }
+}
+
+/* NITA_MV_STEAL=0 restores the fixed row split, for A/B measurement. */
+static int steal_mode(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("NITA_MV_STEAL");
+        mode = (e && *e == '0') ? 0 : 1;
+    }
+    return mode;
 }
 
 static mt_pool_t *pool_create(int n, size_t rowcap)
@@ -976,13 +1012,38 @@ static void mv_dispatch(mt_pool_t *pool, mv_range_t *job)
     pool->completed = 0;
     pool->kind = 0;
     pool->job = *job;                          /* published before the bump */
+    if (steal_mode()) {
+        LONG total = (LONG)(job->hi - job->lo);
+        LONG step  = total / (LONG)(pool->n * 4);
+        if (step < 8)  step = 8;
+        if (step > 64) step = 64;
+        pool->row_step = step;
+        pool->row_end  = (LONG)job->hi;
+        pool->row_next = (LONG)job->lo;
+    } else {
+        pool->row_step = 0;
+    }
     InterlockedExchange(&pool->have_job, 1);
     InterlockedIncrement(&pool->gen);          /* full barrier: job visible */
 
     for (i = 1; i < pool->n; ++i)
         if (pool->waiting[i]) SetEvent(pool->ev[i]);
 
-    {
+    if (pool->row_step > 0) {
+        mv_range_t mine = *job;
+
+        for (;;) {
+            LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+            LONG hi;
+
+            if (lo >= pool->row_end) break;
+            hi = lo + pool->row_step;
+            if (hi > pool->row_end) hi = pool->row_end;
+            mine.lo = (uint64_t)lo;
+            mine.hi = (uint64_t)hi;
+            mv_rows(&mine);
+        }
+    } else {
         mv_range_t mine = *job;
         uint64_t   total = job->hi - job->lo;
         mine.hi = job->lo + total / (uint64_t)pool->n;

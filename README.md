@@ -860,14 +860,12 @@ override):
 
 | checkpoint | 1 thread | 4 | 8 | 12 | 16 |
 |---|---|---|---|---|---|
-| 2B | 169 ms/token | 50 | 31 | - | 31 |
-| 27B | 1.11 s/token | 0.36 s | 0.22 s | 0.18 s | 0.19 s |
+| 2B | 172 ms/token | 49 | 30 | - | 27 |
+| 27B | 1.15 s/token | 0.34 s | 0.20 s | 0.16 s | 0.16 s |
 
-Threads help to about twelve on the 27B; past that the SMT siblings cost as
-much in barrier wait as they return. Twelve is where the row kernels stop being
-the limit: 3.8 GB per token over 0.18 s is 21 GB/s of the ~37 GB/s this machine
-streams with a plain read loop, and the matvec rows alone account for 25 GB/s of
-that. The qwen35 mixer is still most of a Bonsai token, but its
+Threads help to about twelve on the 27B and then flatten: fourteen is within
+noise of twelve and sixteen costs 1%, because past twelve the SMT siblings add
+as much in clock loss as they contribute. The qwen35 mixer is still most of a Bonsai token, but its
 shape has changed twice now. First the three projections moved onto the integer
 kernels and the pool (55%, 19% and 18.5% of a token, all single-threaded,
 became single-digit); then the delta rule, which was 24.8% of the 2B once the
@@ -902,9 +900,33 @@ eight lanes at a time, exported as `nita_silu_inplace`/`nita_silu_mul` instead o
 a second copy of the polynomial: conv 25.3 -> 2.3 ms, gated-norm 24.5 -> 10.1 ms,
 27B token 204 -> 177 ms at twelve threads and 2B 39 -> 31 ms. (A first version
 of this wrote its own Cephes `exp` in qwen35.c; it measured the same and was
-folded back into the existing kernel.) What is left of a token is 142 ms of
-matvec at 25 GB/s plus 10 ms of delta-rule arithmetic that no thread count
-removes.
+folded back into the existing kernel.)
+
+The next question was why the row kernels ran at 25 GB/s when a plain read loop
+on this machine streams 34. Instrumenting the pool for one build showed it was
+not the memory: the average participant finished a matvec slice in 347 us while
+the slowest took 439, and every dispatch waited for that one, so a fifth of
+every matvec was one thread working alone. The split handed each participant a
+fixed twelfth of the rows and nothing rebalanced it. Rows are now claimed in
+blocks of `rows / (threads * 4)` from a shared counter, so a participant that
+falls behind - memory latency, a preempted thread, a slower CCD - stops being
+the critical path. Dispatch time fell from 450 us to 393 us on average and the
+27B token from 176 to 160 ms at twelve threads, with the 8-thread case gaining
+most (216 -> 198 ms) because that is where the tail was largest. Which rows a
+thread gets changes; the reduction each row does does not, so the logits are
+bit-identical to the fixed split - checked with `NITA_MV_STEAL=0`, which keeps
+the old path for exactly that A/B.
+
+That leaves the kernel itself, and it is not waiting on memory either. Run the
+same dot over sixteen hot rows so every load hits L1 and it does 3.6 GB/s on one
+thread against 3.4 GB/s over cold rows, and 28-31 GB/s at twelve threads against
+25-28 cold: the Q1_0 kernel is instruction-bound at about six or seven weights
+per cycle, so the 34 GB/s a read loop reaches was never its ceiling. Holding two
+rows open per thread to double the memory-level parallelism was tried for this:
++10% on one thread, -5% at twelve, dropped. A 27B token is now 123 ms of matvec
+- 3.66 GB at 30 GB/s, which is that kernel limit - plus 26 ms of serial mixer
+work (11 of them the delta rule) and about 10 ms of embedding, rotations and
+sampling.
 
 The pool exists on Windows only; elsewhere the same code runs one thread.
 Against llama.cpp, what is still missing is runtime ISA dispatch (the build
