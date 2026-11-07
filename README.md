@@ -923,7 +923,17 @@ thread against 3.4 GB/s over cold rows, and 28-31 GB/s at twelve threads against
 25-28 cold: the Q1_0 kernel is instruction-bound at about six or seven weights
 per cycle, so the 34 GB/s a read loop reaches was never its ceiling. Holding two
 rows open per thread to double the memory-level parallelism was tried for this:
-+10% on one thread, -5% at twelve, dropped. A 27B token is now 123 ms of matvec
++10% on one thread, -5% at twelve, dropped.
+
+Applying the sign with a 0/1 mask multiply and the correction that goes with it
+(`sum w q = 2 sum p q - sum q`, the second term being 32-element activation sums
+that are already stored) was tried next. It is exact - 8e-8 against an integer
+reference, where the sign flip is 7e-9 - and no faster: 3.39 GB/s against 3.44
+solo, and 159 against 157 ms a token at twelve threads, both inside this
+machine's noise. The sign flip is two uops per 32 weights and the kernel does not
+appear to wait on them; dropping it did not move the rate, so it stayed.
+
+A 27B token is now 123 ms of matvec
 - 3.66 GB at 30 GB/s, which is that kernel limit - plus 26 ms of serial mixer
 work (11 of them the delta rule) and about 10 ms of embedding, rotations and
 sampling.
