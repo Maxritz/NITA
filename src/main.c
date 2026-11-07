@@ -3,9 +3,11 @@
  *
  *   nita --model <path.gguf> [--port 7777] [--host 0.0.0.0]
  *        [--ctx 2048] [--name <served-model-id>] [--quant-type Q]
- *        [--inspect] [--version] [--help]
+ *        [--inspect] [--tensor-table] [--version] [--help]
  *
  * --inspect prints the GGUF metadata and tensor table, then exits.
+ * --tensor-table prints the header facts and every tensor as tab-separated
+ * fields for tools/gguf_probe.py --engine to compare, then exits.
  */
 
 #include "nita.h"
@@ -69,6 +71,7 @@ static void print_usage(FILE *f, const char *argv0)
         "  --name <id>         model id served by /v1/models (default: file stem)\n"
         "  --quant-type <name> label to report for the compiled kernel\n"
         "  --inspect           print model metadata and exit\n"
+        "  --tensor-table      print the tensor table as tab-separated fields\n"
         "  --tokenize <text>   print token ids and decode round-trip, then exit\n"
         "                      (\"-\" reads the text from stdin)\n"
         "  --logits <text>     run the forward pass on text, print logits\n"
@@ -804,6 +807,30 @@ static int run_logits(const gguf_file_t *g, const tokenizer_t *tok, const char *
     return 0;
 }
 
+/* One tensor per line: name, type id, dims, offset - the fields the GGUF
+ * reader produces and the ones an independent parse can be held against. The
+ * human-readable --inspect listing stops at 40 tensors and omits offsets, so a
+ * mis-read entry in the middle of a 851-tensor file would not show up there. */
+static void tensor_table(const gguf_file_t *g)
+{
+    uint64_t i;
+
+    printf("version\t%u\n", g->version);
+    printf("tensors\t%llu\n", (unsigned long long)g->tensor_count);
+    printf("keys\t%llu\n", (unsigned long long)g->kv_count);
+    printf("data_offset\t%llu\n", (unsigned long long)g->data_offset);
+
+    for (i = 0; i < g->tensor_count; ++i) {
+        const gguf_tensor_t *t = &g->tensors[i];
+        uint32_t             d;
+
+        printf("%s\t%u\t", t->name, (unsigned)t->type);
+        for (d = 0; d < t->n_dims; ++d)
+            printf("%s%llu", d ? "," : "", (unsigned long long)t->dims[d]);
+        printf("\t%llu\n", (unsigned long long)t->offset);
+    }
+}
+
 static void inspect(const gguf_file_t *g, const tokenizer_t *tok)
 {
     uint64_t i;
@@ -873,6 +900,7 @@ int main(int argc, char **argv)
     int         port = 7777;
     int         ctx = 2048;
     int         want_inspect = 0;
+    int         want_tensor_table = 0;
     int         bench_n = 0;
     int         prefill_n = 0;
     int         reps_n = 5;
@@ -900,6 +928,8 @@ int main(int argc, char **argv)
             quant_label = argv[++i];
         } else if (strcmp(a, "--inspect") == 0) {
             want_inspect = 1;
+        } else if (strcmp(a, "--tensor-table") == 0) {
+            want_tensor_table = 1;
         } else if (strcmp(a, "--bench") == 0 && i + 1 < argc) {
             bench_n = atoi(argv[++i]);
         } else if (strcmp(a, "--prefill") == 0 && i + 1 < argc) {
@@ -966,6 +996,13 @@ int main(int argc, char **argv)
             tokenizer_free(tok);
             gguf_free(g);
             return trc;
+        }
+
+        if (want_tensor_table) {
+            tensor_table(g);
+            tokenizer_free(tok);
+            gguf_free(g);
+            return 0;
         }
 
         if (want_inspect) {

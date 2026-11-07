@@ -84,24 +84,33 @@ class Reader:
         return f"<{n} strings>"
 
 
-def engine_header(exe, path):
-    proc = subprocess.run([exe, "--model", os.path.abspath(path), "--inspect"],
-                          capture_output=True, text=True)
+HEADER_FIELDS = ("version", "tensors", "keys", "data_offset")
+
+
+def engine_table(exe, path):
+    """Header facts and the whole tensor table as the engine parsed them."""
+    proc = subprocess.run([exe, "--model", os.path.abspath(path),
+                           "--tensor-table"], capture_output=True, text=True)
     if proc.returncode != 0:
         raise SystemExit(f"engine exited {proc.returncode}: "
                          f"{proc.stderr.strip()[:200]}")
-    names = {"GGUF version": "version", "tensors": "tensors",
-             "metadata keys": "kv", "data offset": "data_offset"}
-    got = {}
+
+    header, rows = {}, []
     for line in proc.stdout.splitlines():
-        key, _, value = line.partition(":")
-        key = key.strip()
-        if key in names and value.strip().isdigit():
-            got[names[key]] = int(value)
-    missing = [n for n in names.values() if n not in got]
+        fields = line.split("\t")
+        if len(fields) == 2 and fields[0] in HEADER_FIELDS:
+            header[fields[0]] = int(fields[1])
+        elif len(fields) == 4:
+            dims = tuple(int(x) for x in fields[2].split(",") if x)
+            rows.append((fields[0], int(fields[1]), dims, int(fields[3])))
+
+    missing = [f for f in HEADER_FIELDS if f not in header]
     if missing:
-        raise SystemExit(f"engine --inspect did not report {', '.join(missing)}")
-    return got
+        raise SystemExit(f"engine --tensor-table did not report {', '.join(missing)}")
+    if len(rows) != header["tensors"]:
+        raise SystemExit(f"engine printed {len(rows)} tensor rows but reports "
+                         f"{header['tensors']} tensors")
+    return header, rows
 
 
 def main():
@@ -199,17 +208,33 @@ def main():
     print(f"layout check    : {'CONSISTENT' if ok else 'MISMATCH'}")
 
     if engine:
-        want = {"version": version, "tensors": n_tensors, "kv": n_kv,
-                "data_offset": data_offset}
-        got = engine_header(engine, path)
-        differ = {k: f"engine {got[k]} != file {want[k]}"
-                  for k in want if got[k] != want[k]}
-        if differ:
-            print("engine check    : DISAGREE " +
-                  "; ".join(f"{k} ({v})" for k, v in differ.items()))
+        # Header first, then every tensor: a reader that mis-reads one entry's
+        # name, type, dims or offset is invisible to totals that still add up.
+        want_hdr = {"version": version, "tensors": n_tensors, "keys": n_kv,
+                    "data_offset": data_offset}
+        hdr, rows = engine_table(engine, path)
+
+        problems = [f"header {k}: engine {hdr[k]} != file {want_hdr[k]}"
+                    for k in HEADER_FIELDS if hdr[k] != want_hdr[k]]
+        if len(rows) != len(tensors):
+            problems.append(f"tensor count: engine {len(rows)} != file {len(tensors)}")
+        for i, (file_row, engine_row) in enumerate(zip(tensors, rows)):
+            name, dims, ttype, offset = file_row
+            if engine_row != (name, ttype, tuple(dims), offset):
+                problems.append(f"{name or f'tensor #{i}'}: engine {engine_row} "
+                                f"!= file {(name, ttype, tuple(dims), offset)}")
+            if len(problems) > 5:
+                problems.append("... further differences not listed")
+                break
+
+        if problems:
+            print(f"engine table    : DISAGREE ({len(problems)})")
+            for p in problems:
+                print(f"  {p}")
             ok = False
         else:
-            print("engine check    : AGREE (version, tensors, keys, data offset)")
+            print(f"engine table    : AGREE ({len(rows)} tensors, "
+                  f"name/type/dims/offset and header)")
     return 0 if ok else 1
 
 
