@@ -288,15 +288,26 @@ so a test picks up the same sources and flags as the engine.
 |------|--------|-------|
 | `hadamard` | `hadamard_test` | nothing |
 | `q35_heads` | `q35_heads_test` | nothing |
-| `q35_probe` | `q35_probe` | a checkpoint |
-| `quant_dot` | `quant_dot_test` | a checkpoint |
-| `fork_match` | `tools/check_fork_match.py` | a checkpoint and the fork driver |
+| `q35_probe@<stem>` | `q35_probe` | a checkpoint |
+| `quant_dot@<stem>` | `quant_dot_test` | a checkpoint |
+| `fork_match@<stem>` | `tools/check_fork_match.py` | a checkpoint and the fork driver |
 
-The three that read a GGUF register only when one is named:
+The three that read a GGUF register once per checkpoint, named after the file
+(`Ternary-Bonsai-2-2B-PTQ1_0`, `Bonsai-27B-Q1_0`), so `-DNITA_TEST_MODELS`
+takes a semicolon-separated list and one configure covers every checkpoint on
+the machine:
 
 ```bash
-cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf
+cmake -S . -B build \
+      -DNITA_TEST_MODELS='/models/Ternary-Bonsai-2-2B-PTQ1_0.gguf;/models/Bonsai-27B-Q1_0.gguf'
 ```
+
+A path that does not exist is reported and skipped rather than registered as a
+failure, so the same configure works on a machine that holds only one of them,
+and `-DNITA_TEST_MODEL=<one path>` still sets the list to that single entry.
+Because CTest matches names as substrings, `ctest -R fork_match` still selects
+every checkpoint's comparison; `ctest -L checkpoint` selects the six entries
+that need a model.
 
 `fork_match` is the logits check against the reference runtime, with no
 by-hand steps: it runs both binaries on tokens `5,6,7`, dumps every tagged

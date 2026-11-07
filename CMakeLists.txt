@@ -223,14 +223,30 @@ endif()
 #   cmake --build build && ctest --test-dir build
 #
 # hadamard and q35_heads need no checkpoint, so they always register. The ones
-# that read a model file are built unconditionally and registered only when one
-# is supplied with -DNITA_TEST_MODEL=<path>. tests/kernel_test.c and
+# that read a model file are built unconditionally and registered once per
+# checkpoint named in -DNITA_TEST_MODELS=<path>[;<path>...]. A list rather than
+# one path because the two Bonsai checkpoints differ in quantisation type
+# (PTQ1_0 against Q1_0), block count and head geometry, and a run that loads
+# both covers both without a re-configure in between. Each checkpoint's tests
+# carry its file stem, so the names stay unique and `ctest -R fork_match` still
+# selects every checkpoint's comparison. tests/kernel_test.c and
 # tests/model_test.c are left out: neither has a main(), and the first includes
 # a header the tree no longer has.
 # ------------------------------------------------------------------
 include(CTest)
+set(NITA_TEST_MODELS "" CACHE STRING
+    "Bonsai checkpoints for the checkpoint tests; semicolon-separated list")
 set(NITA_TEST_MODEL "" CACHE FILEPATH
-    "Bonsai checkpoint for the q35_probe test; empty to skip it")
+    "Single-checkpoint alias for NITA_TEST_MODELS")
+if(NITA_TEST_MODEL)
+    if(NITA_TEST_MODELS)
+        message(WARNING
+            "checkpoint tests: NITA_TEST_MODEL is ignored because "
+            "NITA_TEST_MODELS is set")
+    else()
+        set(NITA_TEST_MODELS "${NITA_TEST_MODEL}")
+    endif()
+endif()
 
 add_executable(hadamard_test tests/hadamard_test.c)
 target_link_libraries(hadamard_test PRIVATE nita_core)
@@ -245,13 +261,6 @@ target_link_libraries(q35_probe PRIVATE nita_core)
 
 add_executable(quant_dot_test tests/quant_dot_test.c)
 target_link_libraries(quant_dot_test PRIVATE nita_core)
-
-if(NITA_TEST_MODEL)
-    add_test(NAME q35_probe  COMMAND q35_probe  ${NITA_TEST_MODEL})
-    # --all walks the tensor table and tests every quantised type the file
-    # stores, so this entry does not have to name a type id that could drift.
-    add_test(NAME quant_dot  COMMAND quant_dot_test --all ${NITA_TEST_MODEL})
-endif()
 
 # Comparing against the reference runtime needs two things this repository does
 # not build: the PrismML llama.cpp and the driver linked against it, which is
@@ -270,14 +279,43 @@ if(NOT _fork_test_driver)
     set(_fork_test_driver "${NITA_FORK_DRIVER}")
 endif()
 
-if(NITA_TEST_MODEL AND _fork_test_driver AND Python3_Interpreter_FOUND)
-    add_test(NAME fork_match
-             COMMAND ${Python3_EXECUTABLE}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fork_match.py
-                     --engine $<TARGET_FILE:nita>
-                     --fork ${_fork_test_driver}
-                     --model ${NITA_TEST_MODEL})
-    set_tests_properties(fork_match PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+set(_registered_tags "")
+foreach(_model ${NITA_TEST_MODELS})
+    if(NOT EXISTS "${_model}")
+        message(STATUS "checkpoint tests: no file at ${_model}, skipped")
+        continue()
+    endif()
+
+    get_filename_component(_stem "${_model}" NAME_WE)
+    set(_tag "${_stem}")
+    set(_n 1)
+    while(_tag IN_LIST _registered_tags)   # same filename in two directories
+        math(EXPR _n "${_n} + 1")
+        set(_tag "${_stem}#${_n}")
+    endwhile()
+    list(APPEND _registered_tags "${_tag}")
+
+    add_test(NAME q35_probe@${_tag} COMMAND q35_probe "${_model}")
+    # --all walks the tensor table and tests every quantised type the file
+    # stores, so this entry does not have to name a type id that could drift.
+    add_test(NAME quant_dot@${_tag} COMMAND quant_dot_test --all "${_model}")
+    set_tests_properties(q35_probe@${_tag} quant_dot@${_tag}
+                         PROPERTIES LABELS "checkpoint")
+
+    if(_fork_test_driver AND Python3_Interpreter_FOUND)
+        add_test(NAME fork_match@${_tag}
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fork_match.py
+                         --engine $<TARGET_FILE:nita>
+                         --fork ${_fork_test_driver}
+                         --model "${_model}")
+        set_tests_properties(fork_match@${_tag}
+                             PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77
+                                        LABELS "checkpoint")
+    endif()
+endforeach()
+if(NOT _registered_tags)
+    message(STATUS "checkpoint tests: none, set -DNITA_TEST_MODELS=<a.gguf>[;...]")
 endif()
 
 message(STATUS "Project: NITA (NC Inference Tool for All)")
