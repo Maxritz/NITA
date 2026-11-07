@@ -203,6 +203,10 @@ fork already tags its mixer internals; the only local addition is a
 
 ### Reading the dumps
 
+`tools/check_fork_match.py` does the whole round trip in one command - runs both
+bins on the same tokens, writes both dumps, compares the logits and every tap,
+and exits non-zero on a drift. That is what the `fork_match` test runs; see
+*Tests* under Build for the thresholds. To look at a disagreement by hand,
 `tools/compare_taps.py mine.txt fork.txt` prints the cosine and norm ratio of
 every tap both sides wrote. Two things to know about the files: ggml renames
 views to `<name> (view)`, and those lines are skipped (their second field is not
@@ -270,18 +274,31 @@ cmake --build build && ctest --test-dir build --output-on-failure
 Everything but `main()` is built into a `nita_core` library that the tests link,
 so a test picks up the same sources and flags as the engine.
 
-| Test | Target | Needs a checkpoint |
-|------|--------|--------------------|
-| `hadamard` | `hadamard_test` | no |
-| `q35_heads` | `q35_heads_test` | no |
-| `q35_probe` | `q35_probe` | yes |
-| `quant_dot` | `quant_dot_test` | yes |
+| Test | Target | Needs |
+|------|--------|-------|
+| `hadamard` | `hadamard_test` | nothing |
+| `q35_heads` | `q35_heads_test` | nothing |
+| `q35_probe` | `q35_probe` | a checkpoint |
+| `quant_dot` | `quant_dot_test` | a checkpoint |
+| `fork_match` | `tools/check_fork_match.py` | a checkpoint and the fork driver |
 
-The two that read a GGUF register only when one is named:
+The three that read a GGUF register only when one is named:
 
 ```bash
-cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf
+cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf \
+      -DNITA_FORK_LOGITS=build/llama_logits_fork.exe
 ```
+
+`fork_match` is the logits check against the reference runtime, with no
+by-hand steps: it runs both binaries on tokens `5,6,7`, dumps every tagged
+tensor, and fails on any of four conditions - logits cosine under 0.9999, a
+different argmax, a different top-5 set, or any tap under 0.995. On the 2B it
+reports cosine 0.999989 over all 248320 logits with 187 taps compared, worst
+0.999784, in about six seconds; the 27B takes about a minute and a half and
+lands at 0.999961 with 497 taps. The driver is not built here (it needs the PrismML
+fork, see *The reference harness*), so without it the entry is simply not
+registered, and if the path goes stale the script exits 77 and CTest calls it a
+skip rather than a pass.
 
 `quant_dot` does not take a type id from the caller: `--all` reads the file's
 tensor table and runs every quantised type it finds, so the test cannot quietly

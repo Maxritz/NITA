@@ -173,6 +173,26 @@ if(NITA_TEST_MODEL)
     add_test(NAME quant_dot  COMMAND quant_dot_test --all ${NITA_TEST_MODEL})
 endif()
 
+# Comparing against the reference runtime needs two things this repository does
+# not build: the PrismML llama.cpp and the driver linked against it, which is
+# tools/llama_logits.c (see README, "The reference harness"). Name the driver
+# with -DNITA_FORK_LOGITS and the check joins the suite; the script exits 77
+# when a piece is missing, which CTest reports as a skip rather than a pass.
+set(NITA_FORK_LOGITS "" CACHE FILEPATH
+    "logits driver linked against the PrismML fork; empty to skip the check")
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+if(NITA_TEST_MODEL AND NITA_FORK_LOGITS AND Python3_Interpreter_FOUND)
+    add_test(NAME fork_match
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fork_match.py
+                     --engine $<TARGET_FILE:nita>
+                     --fork ${NITA_FORK_LOGITS}
+                     --model ${NITA_TEST_MODEL})
+    set_tests_properties(fork_match PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+endif()
+
 message(STATUS "Project: NITA (NC Inference Tool for All)")
 message(STATUS "Engine flags:")
 message(STATUS "  QUANTIZED_GEMV=${QUANTIZED_GEMV}")
