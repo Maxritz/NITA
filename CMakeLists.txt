@@ -138,6 +138,86 @@ else()
 endif()
 
 # ------------------------------------------------------------------
+# Optional: the reference logits driver
+#
+# tools/llama_logits.c prints llama.cpp's own logits, which is what the logits
+# in the README were checked against. It links the PrismML fork, which is not
+# part of this repository, so it is built only when a checkout is present.
+# "Configured" means build-mingw exists: that step is the fork's own advice
+# (see README) and involves a local patch, so it stays a manual step.
+# ------------------------------------------------------------------
+set(NITA_FORK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/prism-llama" CACHE PATH
+    "PrismML llama.cpp checkout with a configured build-mingw directory")
+
+set(NITA_FORK_DRIVER "")
+set(_fork_libs
+    "${NITA_FORK_DIR}/build-mingw/src/libllama.a"
+    "${NITA_FORK_DIR}/build-mingw/ggml/src/ggml.a"
+    "${NITA_FORK_DIR}/build-mingw/ggml/src/ggml-cpu.a"
+    "${NITA_FORK_DIR}/build-mingw/ggml/src/ggml-base.a"
+    "${NITA_FORK_DIR}/build-mingw/vendor/hash/libvendor-hash.a")
+
+if(NITA_FORK_DIR AND EXISTS "${NITA_FORK_DIR}/include/llama.h")
+    set(_fork_missing "")
+    foreach(_lib ${_fork_libs})
+        if(NOT EXISTS "${_lib}")
+            list(APPEND _fork_missing ${_lib})
+        endif()
+    endforeach()
+
+    if(_fork_missing)
+        message(STATUS "fork logits driver: skipped, missing:")
+        foreach(_lib ${_fork_missing})
+            message(STATUS "  ${_lib}")
+        endforeach()
+    else()
+        add_executable(fork_logits tools/llama_logits.c)
+        target_include_directories(fork_logits PRIVATE
+            "${NITA_FORK_DIR}/include"
+            "${NITA_FORK_DIR}/ggml/include")
+        if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            # Opt this one target out of the project's -march=znver3/-mavx2.
+            # With AVX enabled GCC kept the driver's struct arguments and
+            # buffers as 32-byte stack slots addressed with vmovdqa, which
+            # demands 32-byte alignment; Windows only guarantees 16 at main's
+            # entry, so the first such store segfaulted whenever ASLR placed
+            # the stack at 16 mod 32 - measured 7/20 runs with AVX against
+            # 0/24 without, and the faulting instruction was
+            # vmovdqa %ymm3,0x150(%rsp) in main. The driver only parses argv
+            # and prints numbers, so baseline x86-64 costs it nothing, and the
+            # fork's own AVX code lives in libraries built separately.
+            target_compile_options(fork_logits PRIVATE -mno-avx -mno-avx2)
+        endif()
+        target_link_libraries(fork_logits PRIVATE ${_fork_libs})
+        if(WIN32)
+            target_link_libraries(fork_logits PRIVATE
+                ws2_32 ole32 uuid advapi32 shlwapi)
+        endif()
+        if(MINGW)
+            # llama.cpp is C++, this driver is C: gcc would not pull the C++
+            # runtime in on its own.
+            target_link_libraries(fork_logits PRIVATE stdc++)
+            # The toolchain's bin is not necessarily on PATH where CTest starts
+            # the process - a missing runtime DLL kills it with no output at
+            # all - so put the DLLs next to the executable.
+            # The DLLs sit in the toolchain's bin, which -print-file-name does
+            # not search (it only reports its library directories).
+            get_filename_component(_mingw_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+            foreach(_dll libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll)
+                if(EXISTS "${_mingw_bin}/${_dll}")
+                    add_custom_command(TARGET fork_logits POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                                "${_mingw_bin}/${_dll}"
+                                "$<TARGET_FILE_DIR:fork_logits>")
+                endif()
+            endforeach()
+        endif()
+        set(NITA_FORK_DRIVER $<TARGET_FILE:fork_logits>)
+        message(STATUS "fork logits driver: fork_logits, linking ${NITA_FORK_DIR}")
+    endif()
+endif()
+
+# ------------------------------------------------------------------
 # Tests
 #
 #   cmake --build build && ctest --test-dir build
@@ -179,16 +259,23 @@ endif()
 # with -DNITA_FORK_LOGITS and the check joins the suite; the script exits 77
 # when a piece is missing, which CTest reports as a skip rather than a pass.
 set(NITA_FORK_LOGITS "" CACHE FILEPATH
-    "logits driver linked against the PrismML fork; empty to skip the check")
+    "logits driver linked against the PrismML fork; empty to use fork_logits")
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
-if(NITA_TEST_MODEL AND NITA_FORK_LOGITS AND Python3_Interpreter_FOUND)
+# A driver named by hand wins over the one built here, so a checkout that lives
+# somewhere else can still be used.
+set(_fork_test_driver "${NITA_FORK_LOGITS}")
+if(NOT _fork_test_driver)
+    set(_fork_test_driver "${NITA_FORK_DRIVER}")
+endif()
+
+if(NITA_TEST_MODEL AND _fork_test_driver AND Python3_Interpreter_FOUND)
     add_test(NAME fork_match
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fork_match.py
                      --engine $<TARGET_FILE:nita>
-                     --fork ${NITA_FORK_LOGITS}
+                     --fork ${_fork_test_driver}
                      --model ${NITA_TEST_MODEL})
     set_tests_properties(fork_match PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
 endif()

@@ -193,6 +193,14 @@ llama.cpp cannot load these files at all - it rejects `token_embd.weight` as
 
 `tools/llama_logits.c` links against that library and prints llama.cpp's logits
 for an explicit token sequence, which is the same thing `nita --tokens` prints.
+CMake builds it as `fork_logits` whenever `${NITA_FORK_DIR}/include/llama.h` and
+the fork's five static libraries are present, and skips it with a list of what
+is missing otherwise; `-DNITA_FORK_LOGITS=<exe>` points `fork_match` at some
+other build instead. The driver is compiled without AVX (`-mno-avx -mno-avx2`,
+see the comment in `CMakeLists.txt`): with the project's `-march=znver3` it
+segfaulted in about half of all runs, because GCC then kept its stack
+structures 32-byte aligned with `vmovdqa` while Windows only aligns the stack
+to 16 at `main`'s entry. The fork libraries hold the AVX code, not this file.
 `NITA_FORK_DUMP=<path>` (fork side) and `NITA_Q35_DUMP=<path>` (engine side)
 dump the tagged intermediates - `attn_norm-<l>`, `l_out-<l>`, and the mixer's
 `conv_output_silu`, `q_conv_predelta`, `v_conv_predelta`, `z`, `final_output` -
@@ -259,6 +267,8 @@ Produces `nita` (plus a `minimal_engine` compatibility copy).
 | `-DMXFP8=ON` | Forces a compile-time error (not on AVX2) |
 | `-DSHERLOCK_LITE=ON` | Component trace table on stdout |
 | `-DDEBUG_BREADCRUMBS=ON` | Breadcrumb markers on stderr |
+| `-DNITA_FORK_DIR=<dir>` | PrismML checkout with `build-mingw` (default `build/prism-llama`) |
+| `-DNITA_FORK_LOGITS=<exe>` | Use this fork driver instead of the built one |
 
 Exactly one quantisation flag should be enabled; the build derives
 `QUANT_TYPE` from it. The transformer itself reads the per-tensor types
@@ -285,8 +295,7 @@ so a test picks up the same sources and flags as the engine.
 The three that read a GGUF register only when one is named:
 
 ```bash
-cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf \
-      -DNITA_FORK_LOGITS=build/llama_logits_fork.exe
+cmake -S . -B build -DNITA_TEST_MODEL=/path/to/model.gguf
 ```
 
 `fork_match` is the logits check against the reference runtime, with no
@@ -295,9 +304,10 @@ tensor, and fails on any of four conditions - logits cosine under 0.9999, a
 different argmax, a different top-5 set, or any tap under 0.995. On the 2B it
 reports cosine 0.999989 over all 248320 logits with 187 taps compared, worst
 0.999784, in about six seconds; the 27B takes about a minute and a half and
-lands at 0.999961 with 497 taps. The driver is not built here (it needs the PrismML
-fork, see *The reference harness*), so without it the entry is simply not
-registered, and if the path goes stale the script exits 77 and CTest calls it a
+lands at 0.999961 with 497 taps. The entry is registered only when the fork
+driver exists - `fork_logits`, built here when the PrismML checkout has been
+built (see *The reference harness*), or whatever `-DNITA_FORK_LOGITS` names -
+and if the binary later goes missing the script exits 77 and CTest calls it a
 skip rather than a pass.
 
 `quant_dot` does not take a type id from the caller: `--all` reads the file's
