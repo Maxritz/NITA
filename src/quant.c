@@ -946,17 +946,6 @@ static float dot_i8_scalar(const int8_t *x, const int8_t *w)
 #endif
 
 #if defined(__AVX2__)
-/* eight packed sign bytes become one 32-byte weight vector, in registers */
-static __m256i q1_expand(const int64_t *T, const uint8_t *s)
-{
-    const __m128i lo = _mm_unpacklo_epi64(_mm_cvtsi64_si128(T[s[0]]),
-                                          _mm_cvtsi64_si128(T[s[1]]));
-    const __m128i hi = _mm_unpacklo_epi64(_mm_cvtsi64_si128(T[s[2]]),
-                                          _mm_cvtsi64_si128(T[s[3]]));
-
-    return _mm256_set_m128i(hi, lo);
-}
-
 /* eight stored slot bytes become one 32-byte weight vector.
  *
  * No table here: the eight table loads this started as were data-dependent
@@ -1001,48 +990,86 @@ static __m256i q2_expand(const uint8_t *s)
 }
 #endif
 
+#if defined(__AVX2__)
+/* 32 packed +-1 weights against 32 int8 activations, as eight int32 lanes.
+ *
+ * The weights are +-1, so the multiply is a sign flip: xor by an all-ones
+ * byte where the sign is negative, then subtract the same mask (that is the
+ * two's-complement negation; it is exact, and the pair sums that follow stay
+ * inside int16 for any int8 activation). The sign bytes come from a byte
+ * shuffle of the 32-bit bitfield, so this loop has no data-dependent address
+ * and no dependence on the previous block. */
+static inline __m256 q1_dot32(const uint8_t *s, const int8_t *x,
+                              __m256i ones8, __m256i ones16)
+{
+    const __m256i q  = _mm256_loadu_si256((const __m256i *)x);
+    const __m256i m  = _mm256_xor_si256(bits_32(s),
+                                         _mm256_set1_epi8((char)-1));
+    const __m256i sq = _mm256_sub_epi8(_mm256_xor_si256(q, m), m);
+
+    return _mm256_cvtepi32_ps(_mm256_madd_epi16(
+               _mm256_maddubs_epi16(ones8, sq), ones16));
+}
+#endif
+
 /* Q1_0: 18 bytes / 128 weights: d f16 + 16 sign bytes; element j is bit
- * j%8 of byte j/8, so 32 consecutive elements come from 4 stored bytes. */
+ * j%8 of byte j/8, so 32 consecutive elements come from 4 stored bytes.
+ *
+ * The four sub-blocks of a stored block are independent, so they get one
+ * float accumulator each: a single chain serialised every block behind the
+ * four-cycle FMA latency, which is what held this kernel at six weights per
+ * cycle no matter how fast the memory was. */
 static float dot_q1_0(const uint8_t *row, const nita_aq8_t *a, int nb)
 {
     float acc = 0.0f;
     int   sb;
 
 #if defined(__AVX2__)
-    __m256 vacc = _mm256_setzero_ps();
+    const __m256i ones8  = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 v0 = _mm256_setzero_ps(), v1 = _mm256_setzero_ps();
+    __m256 v2 = _mm256_setzero_ps(), v3 = _mm256_setzero_ps();
 #endif
 
     for (sb = 0; sb < nb / 4; ++sb) {
-        const uint8_t *blk = row + (size_t)sb * 18;
-        const uint8_t *qs  = blk + 2;
-        float          dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
-        const int64_t *T   = q1_table();
-        int            j;
-
-        for (j = 0; j < 4; ++j) {
-            const nita_aq8_t *ab = &a[sb * 4 + j];
-            int8_t            w[32];
-            int               k;
+        const uint8_t    *blk = row + (size_t)sb * 18;
+        const uint8_t    *qs  = blk + 2;
+        float             dw  = nita_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        const nita_aq8_t *ab  = &a[sb * 4];
 
 #if defined(__AVX2__)
-            vacc = _mm256_fmadd_ps(dot_i8_vec(ab->qs, q1_expand(T, qs + j * 4)),
-                                   _mm256_set1_ps(dw * ab->d), vacc);
-            (void)w;
-            (void)k;
+        v0 = _mm256_fmadd_ps(q1_dot32(qs + 0,  ab[0].qs, ones8, ones16),
+                             _mm256_set1_ps(dw * ab[0].d), v0);
+        v1 = _mm256_fmadd_ps(q1_dot32(qs + 4,  ab[1].qs, ones8, ones16),
+                             _mm256_set1_ps(dw * ab[1].d), v1);
+        v2 = _mm256_fmadd_ps(q1_dot32(qs + 8,  ab[2].qs, ones8, ones16),
+                             _mm256_set1_ps(dw * ab[2].d), v2);
+        v3 = _mm256_fmadd_ps(q1_dot32(qs + 12, ab[3].qs, ones8, ones16),
+                             _mm256_set1_ps(dw * ab[3].d), v3);
 #else
-            for (k = 0; k < 4; ++k) {
-                int64_t v = T[qs[j * 4 + k]];
-                int     m;
+        {
+            const int64_t *T = q1_table();
+            int            j;
 
-                for (m = 0; m < 8; ++m)
-                    w[k * 8 + m] = (int8_t)(uint8_t)((uint64_t)v >> (8 * m));
+            for (j = 0; j < 4; ++j) {
+                const nita_aq8_t *aq = &ab[j];
+                int8_t            w[32];
+                int               k, m;
+
+                for (k = 0; k < 4; ++k) {
+                    int64_t v = T[qs[j * 4 + k]];
+
+                    for (m = 0; m < 8; ++m)
+                        w[k * 8 + m] = (int8_t)(uint8_t)((uint64_t)v >> (8 * m));
+                }
+                acc += dw * aq->d * dot_i8_scalar(aq->qs, w);
             }
-            acc += dw * ab->d * dot_i8_scalar(ab->qs, w);
-#endif
         }
+#endif
     }
 #if defined(__AVX2__)
-    acc = hsum256_ps(vacc);
+    acc = hsum256_ps(_mm256_add_ps(_mm256_add_ps(v0, v1),
+                                   _mm256_add_ps(v2, v3)));
 #endif
     return acc;
 }

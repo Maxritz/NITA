@@ -858,19 +858,37 @@ single-threaded result, so turning threads up changes speed, not output.
 Measured here (32 logical cores, so 16 threads by default, `NITA_THREADS` to
 override):
 
-| checkpoint | 1 thread | 4 | 8 | 16 |
-|---|---|---|---|---|
-| 2B | 173 ms/token | 54 | 36 | 38 |
-| 27B | 1.43 s/token | - | - | 0.26 s |
+| checkpoint | 1 thread | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|
+| 2B | 176 ms/token | 56 | 39 | - | 39 |
+| 27B | 1.16 s/token | 0.41 s | 0.25 s | 0.21 s | 0.22 s |
 
-Threads help to about eight; past that the SMT siblings cost as much in barrier
-wait as they return. The qwen35 mixer is still most of a Bonsai token, but its
+Threads help to about twelve on the 27B; past that the SMT siblings cost as
+much in barrier wait as they return. Twelve is where the row kernels stop being
+the limit: 3.8 GB per token over 0.21 s is 18 GB/s of the ~37 GB/s this machine
+streams with a plain read loop, and the matvec rows alone account for 25 GB/s of
+that. The qwen35 mixer is still most of a Bonsai token, but its
 shape has changed twice now. First the three projections moved onto the integer
 kernels and the pool (55%, 19% and 18.5% of a token, all single-threaded,
 became single-digit); then the delta rule, which was 24.8% of the 2B once the
 projections were fast. Its value heads are independent - own input slices, own
 state matrix, own output slice - so they split across the pool with no locking
 and 4 heads is enough to be worth a barrier: 0.57 ms/layer to 0.076 ms.
+
+Two kernels were attacked directly and measured against a 432 MB DRAM-resident
+row buffer, because the earlier assumption - that decode was waiting on memory -
+was wrong. Q1_0 built its +-1 sign bytes through a 256-entry table of int64
+words, four data-dependent loads per 32 weights, and chained every block into
+one float accumulator. Deriving the sign mask by shuffling the 32-bit bitfield
+and running the four sub-blocks as four independent accumulators took one core
+from 2.5 GB/s to 3.4 GB/s (19 to 27 G weights/s, about nine weights per cycle)
+and the 27B from 1.43 s to 1.16 s single-threaded. That is the ceiling for this
+algorithm: at nine weights per cycle one core cannot stream fast enough to be
+memory bound, so the bus is only reachable with enough cores in flight, which
+is why the 27B needs twelve threads to reach 18 GB/s. Two ideas measured worse
+and were dropped: independent trit planes in PTQ1_0 (more multiplies than the
+chain they replace, 2.5 -> 2.0 GB/s) and software prefetch in the Q1_0 loop
+(3.3 -> 2.9 GB/s; the hardware prefetcher already covers a sequential row).
 
 The pool exists on Windows only; elsewhere the same code runs one thread.
 Against llama.cpp, what is still missing is runtime ISA dispatch (the build
