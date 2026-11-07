@@ -845,7 +845,17 @@ static DWORD WINAPI mt_worker(LPVOID p)
          * master has invalidated: its buffers may already be freed. */
         if (pool->shutdown || !pool->have_job) continue;
 
-        if (pool->kind == 0 && pool->row_step > 0) {
+        if (pool->kind == 2 && pool->row_step > 0) {
+            for (;;) {
+                LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+                LONG hi;
+
+                if (lo >= pool->row_end) break;
+                hi = lo + pool->row_step;
+                if (hi > pool->row_end) hi = pool->row_end;
+                pool->fn(pool->fn_ctx, (int)lo, (int)hi, id);
+            }
+        } else if (pool->kind == 0 && pool->row_step > 0) {
             mv_range_t j = pool->job;
 
             j.rowbuf = pool->rowbufs[id];
@@ -988,14 +998,35 @@ void nita_parallel_for_min(int n, int min_items, nita_range_fn fn, void *ctx)
     pool->fn     = fn;
     pool->fn_ctx = ctx;
     pool->job.lo = 0;
-    pool->job.hi = (uint64_t)n;                /* published before the bump */
+    pool->job.hi = (uint64_t)n;
+    /* Same claim-in-blocks scheme as the matvec rows. These ranges hold up to
+     * a few thousand uniform items, so the blocks are bigger, but the reason is
+     * the same: a fixed n-way split charges the whole phase for whichever
+     * participant is slowest. Published before the bump like the rest. */
+    {
+        int step = n / (pool->n * 4);
+
+        if (step < 1)  step = 1;
+        if (step > 64) step = 64;
+        pool->row_step = step;
+        pool->row_end  = n;
+        pool->row_next = 0;
+    }
     InterlockedExchange(&pool->have_job, 1);
     InterlockedIncrement(&pool->gen);          /* full barrier: job visible */
 
     for (i = 1; i < pool->n; ++i)
         if (pool->waiting[i]) SetEvent(pool->ev[i]);
 
-    fn(ctx, 0, n / pool->n, 0);
+    for (;;) {
+        LONG lo = InterlockedAdd(&pool->row_next, pool->row_step) - pool->row_step;
+        LONG hi;
+
+        if (lo >= pool->row_end) break;
+        hi = lo + pool->row_step;
+        if (hi > pool->row_end) hi = pool->row_end;
+        fn(ctx, (int)lo, (int)hi, 0);
+    }
     while (pool->completed < pool->n - 1) NITA_PAUSE();
 }
 

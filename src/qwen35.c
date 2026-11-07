@@ -306,6 +306,16 @@ typedef struct {
     float        ascale;
 } gdn_job_t;
 
+/* The three passes used to walk the state one column at a time, which reads a
+ * strided element out of every one of the 128 rows for each output element: 128
+ * passes over 64 KB, all from L2, and a scalar FMA chain per column. Walking a
+ * row at a time into a vector of column accumulators instead does one pass over
+ * the matrix and vectorises across d.
+ *
+ * Splitting a head's columns between threads was tried and measured worse: 64
+ * items of 32 columns ran at 201 us against 134 for 16 items of 128, because a
+ * partial row leaves gaps in the stream that cost more than the four threads a
+ * thirteen-item-per-thread split leaves idle. */
 static void gdn_heads(void *vctx, int lo, int hi, int thread)
 {
     const gdn_job_t *j = (const gdn_job_t *)vctx;
@@ -324,27 +334,34 @@ static void gdn_heads(void *vctx, int lo, int hi, int thread)
         int          i, d;
         float        delta[Q35_MAX_HEAD_V];
 
-        /* delta = (v - g * S^T k) * beta, then the rank-1 state update. */
-        for (d = 0; d < j->hv; ++d) {
-            float acc = 0.0f;
-            for (i = 0; i < j->hk; ++i)
-                acc += S[(size_t)i * (size_t)j->hv + d] * khv[i];
-            delta[d] = (vh[d] - gv * acc) * bv;
+        /* delta = (v - g * S^T k) * beta, then the rank-1 state update. Both
+         * sums still run over i in ascending order, so every column adds the
+         * same terms in the same order as before. */
+        for (d = 0; d < j->hv; ++d) delta[d] = 0.0f;
+        for (i = 0; i < j->hk; ++i) {
+            const float *Sr = S + (size_t)i * (size_t)j->hv;
+            float        ki = khv[i];
+
+            for (d = 0; d < j->hv; ++d) delta[d] += Sr[d] * ki;
         }
+        for (d = 0; d < j->hv; ++d) delta[d] = (vh[d] - gv * delta[d]) * bv;
         for (i = 0; i < j->hk; ++i) {
             float  ki = khv[i];
             float *Sr = S + (size_t)i * (size_t)j->hv;
+
             for (d = 0; d < j->hv; ++d) Sr[d] = gv * Sr[d] + ki * delta[d];
         }
         /* Output uses the updated state, scaled by 1/sqrt(head width) - the
          * fused GDN kernel applies exactly this (gated_delta_net, scale =
          * 1/sqrt(S_v)) before the gated norm. */
-        for (d = 0; d < j->hv; ++d) {
-            float acc = 0.0f;
-            for (i = 0; i < j->hk; ++i)
-                acc += S[(size_t)i * (size_t)j->hv + d] * qh[i];
-            oh[d] = acc * j->ascale;
+        for (d = 0; d < j->hv; ++d) delta[d] = 0.0f;
+        for (i = 0; i < j->hk; ++i) {
+            const float *Sr = S + (size_t)i * (size_t)j->hv;
+            float        qi = qh[i];
+
+            for (d = 0; d < j->hv; ++d) delta[d] += Sr[d] * qi;
         }
+        for (d = 0; d < j->hv; ++d) oh[d] = delta[d] * j->ascale;
     }
 }
 

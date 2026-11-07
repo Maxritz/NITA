@@ -860,12 +860,12 @@ override):
 
 | checkpoint | 1 thread | 4 | 8 | 12 | 16 |
 |---|---|---|---|---|---|
-| 2B | 172 ms/token | 49 | 30 | - | 27 |
-| 27B | 1.15 s/token | 0.34 s | 0.20 s | 0.16 s | 0.16 s |
+| 2B | 163 ms/token | 47 | 29 | - | 23 |
+| 27B | 1.05 s/token | 0.31 s | 0.18 s | 0.15 s | 0.147 s |
 
-Threads help to about twelve on the 27B and then flatten: fourteen is within
-noise of twelve and sixteen costs 1%, because past twelve the SMT siblings add
-as much in clock loss as they contribute. The qwen35 mixer is still most of a Bonsai token, but its
+Threads help to sixteen on the 27B, two percent past twelve: the delta rule
+splits sixteen ways, so the last four threads at least have a whole head each to
+show for the SMT clock loss. The qwen35 mixer is still most of a Bonsai token, but its
 shape has changed twice now. First the three projections moved onto the integer
 kernels and the pool (55%, 19% and 18.5% of a token, all single-threaded,
 became single-digit); then the delta rule, which was 24.8% of the 2B once the
@@ -925,6 +925,35 @@ per cycle, so the 34 GB/s a read loop reaches was never its ceiling. Holding two
 rows open per thread to double the memory-level parallelism was tried for this:
 +10% on one thread, -5% at twelve, dropped.
 
+The two mixer phases that stood out next - the delta rule at 11.3 ms a token and
+the gated norm at 11.6 - were already pooled and scaled 6.8x and 5.8x from one
+thread to twelve, so neither was serial. What they lacked was the queue. The
+generic range dispatch handed every participant a fixed slice, so the gate
+projection (4.4 MB a layer, 6144 rows) was charged for whichever thread was
+slowest; claiming blocks the way the matvec rows do took it from 234 to 182 us a
+layer. The delta rule had the other problem: sixteen heads on twelve threads is
+a 67% ceiling, because four threads run a second head while eight wait. Its
+columns turned out to be independent - the delta, the rank-1 update and the
+output each touch one column of the state and nothing else - so they split too,
+but 32-column blocks measured *worse* (201 us against 134) because a partial row
+leaves gaps in the stream. What won was keeping one head per item and fixing the
+access order instead: the three passes used to walk the state a column at a
+time, 128 strided reads out of a 64 KB matrix for every output element, with a
+scalar FMA chain each. Walking a row at a time into a vector of column
+accumulators does one pass over the matrix and vectorises across the columns:
+1639 -> 305 us a layer on one thread, 241 -> 126 at sixteen. With sixteen items
+on sixteen threads the phase balances exactly, which is why sixteen threads now
+overtake twelve.
+
+That rewrite is the one change here that does not reproduce the old bits: every
+column still sums the same products in the same order, but GCC picks a different
+one of the two products to fuse into an FMA in the new nesting, and the state
+carries that one-ulp difference through the layers - logits move by at most 0.11
+(mean 0.017) while the argmaxes do not change. Built with `-ffp-contract=off`
+the two nestings are bit-identical, which is how the cause was pinned rather
+than guessed. The fork comparison still passes: 27B worst tap 0.998628 against
+0.998754 before, 2B pass.
+
 Applying the sign with a 0/1 mask multiply and the correction that goes with it
 (`sum w q = 2 sum p q - sum q`, the second term being 32-element activation sums
 that are already stored) was tried next. It is exact - 8e-8 against an integer
@@ -933,9 +962,9 @@ solo, and 159 against 157 ms a token at twelve threads, both inside this
 machine's noise. The sign flip is two uops per 32 weights and the kernel does not
 appear to wait on them; dropping it did not move the rate, so it stayed.
 
-A 27B token is now 123 ms of matvec
-- 3.66 GB at 30 GB/s, which is that kernel limit - plus 26 ms of serial mixer
-work (11 of them the delta rule) and about 10 ms of embedding, rotations and
+A 27B token is now 122 ms of matvec
+- 3.66 GB at 30 GB/s, which is that kernel limit - plus 11 ms of serial mixer
+work (6 of them the delta rule) and about 10 ms of embedding, rotations and
 sampling.
 
 The pool exists on Windows only; elsewhere the same code runs one thread.
