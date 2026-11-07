@@ -254,6 +254,28 @@ cmake --build .
 
 Produces `nita` (plus a `minimal_engine` compatibility copy).
 
+Which check to run depends on what changed. After touching the model function
+(`src/qwen35.c` and the rest of the forward pass), `q35_heads` pins the head and
+norm conventions in a few milliseconds and the comparison against the reference
+runtime is what catches the rest - it fails on a wrong mapping that still
+produces finite, plausible numbers:
+
+```bash
+ctest --test-dir build -R 'q35_heads|fork_match'   # logits plus every tap, ~4 s on the 2B
+```
+
+After touching a quantised kernel (`quant_dot`, dequantisation, the Hadamard
+rotation the ternary path leans on) the per-tensor sweeps are what prove it, and
+they run on every checkpoint configured - about a second each on the 27B:
+
+```bash
+ctest --test-dir build -R 'hadamard|quant_dot'
+```
+
+A bare `ctest --test-dir build` is both of those plus the rest in about ten
+seconds, which is usually the right default; see *Tests* for the one entry that
+needs `-DNITA_TEST_SLOW=ON`.
+
 ### CMake options
 
 | Flag | Effect |
