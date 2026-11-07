@@ -9,9 +9,17 @@ PrismML files.
 
 Usage:
     python3 tools/gguf_probe.py G:/More-models/Bonsai-27B-Q1_0.gguf
+    python3 tools/gguf_probe.py --engine build/nita.exe model.gguf
+
+With --engine the four header facts this script derives independently (version,
+tensor count, metadata key count, data offset) are compared against what
+`nita --inspect` reports, so a change to src/gguf.c fails here and not only
+further downstream.
 """
 
+import os
 import struct
+import subprocess
 import sys
 
 # ggml type id -> (name, elements per block, bytes per block)
@@ -76,8 +84,38 @@ class Reader:
         return f"<{n} strings>"
 
 
+def engine_header(exe, path):
+    proc = subprocess.run([exe, "--model", os.path.abspath(path), "--inspect"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"engine exited {proc.returncode}: "
+                         f"{proc.stderr.strip()[:200]}")
+    names = {"GGUF version": "version", "tensors": "tensors",
+             "metadata keys": "kv", "data offset": "data_offset"}
+    got = {}
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key in names and value.strip().isdigit():
+            got[names[key]] = int(value)
+    missing = [n for n in names.values() if n not in got]
+    if missing:
+        raise SystemExit(f"engine --inspect did not report {', '.join(missing)}")
+    return got
+
+
 def main():
-    path = sys.argv[1]
+    argv = sys.argv[1:]
+    engine = None
+    if "--engine" in argv:
+        i = argv.index("--engine")
+        if i + 1 >= len(argv):
+            raise SystemExit("--engine needs the path to nita")
+        engine = os.path.abspath(argv[i + 1])
+        del argv[i:i + 2]
+    if len(argv) != 1:
+        raise SystemExit("usage: gguf_probe.py [--engine nita.exe] model.gguf")
+    path = argv[0]
     with open(path, "rb") as f:
         r = Reader(f)
         if r.take(4) != b"GGUF":
@@ -108,7 +146,6 @@ def main():
     align = struct.unpack("<I", align)[0] if isinstance(align, bytes) else 32
     data_offset = (end_of_table + align - 1) // align * align
 
-    import os
     file_size = os.path.getsize(path)
 
     print(f"file            : {os.path.basename(path)}")
@@ -160,6 +197,19 @@ def main():
     # included in each tensor's own size, so any residual means wrong geometry.
     ok = abs((expected - total)) <= align * 2
     print(f"layout check    : {'CONSISTENT' if ok else 'MISMATCH'}")
+
+    if engine:
+        want = {"version": version, "tensors": n_tensors, "kv": n_kv,
+                "data_offset": data_offset}
+        got = engine_header(engine, path)
+        differ = {k: f"engine {got[k]} != file {want[k]}"
+                  for k in want if got[k] != want[k]}
+        if differ:
+            print("engine check    : DISAGREE " +
+                  "; ".join(f"{k} ({v})" for k, v in differ.items()))
+            ok = False
+        else:
+            print("engine check    : AGREE (version, tensors, keys, data offset)")
     return 0 if ok else 1
 
 

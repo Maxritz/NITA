@@ -272,26 +272,36 @@ they run on every checkpoint configured - about a second each on the 27B:
 ctest --test-dir build -R 'hadamard|quant_dot'
 ```
 
-A change to the GGUF reader (`src/gguf.c`) is checked by the independent reader
-first: it walks the header and tensor table with `struct` only and requires
-every tensor's declared block geometry to account for the file's data section
-exactly, so a wrong element count shows up as a byte gap rather than as
-plausible weights.
+A change to the GGUF reader (`src/gguf.c`) has its own entry, `gguf_probe@<stem>`
+(about half a second on the 2B, 1.3 s on the 27B). The script walks the header and
+tensor table with `struct` alone and requires every tensor's declared block
+geometry to account for the file's data section exactly, so a wrong element
+count is a byte gap rather than plausible weights. With `--engine` it also
+compares the four facts it derived - version, tensor count, metadata key count,
+data offset - against what `nita --inspect` reports, since a probe that never
+ran engine code could not see a reader regression by itself:
 
 ```bash
-python3 tools/gguf_probe.py /path/to/model.gguf     # layout check: CONSISTENT
+python3 tools/gguf_probe.py --engine build/nita.exe /path/to/model.gguf
 ```
 
-The checkpoint entries read the same tables through `src/gguf.c`, so they are
-the end-to-end check, and `nita --inspect` prints what the engine parsed for a
-line-by-line comparison. Be aware that `quant_dot` compares each integer kernel
+On a checkpoint whose `fork_match` is deferred for size this is the only
+structural cover it gets. Note that `quant_dot` compares each integer kernel
 against the row *this engine* dequantised, so it catches a kernel error but not
-a mis-read offset, which moves both sides together - that is `gguf_probe.py`.
+a mis-read offset, which moves both sides together - that is the probe's job.
 
-The tokenizer is not in CTest; it is checked against an independent Python
-implementation of both encoders on a generated vocabulary, which covers the
-merges list, the score ordering and the byte fallback (see *Tokenizer* for what
-that established):
+The tokenizer is covered by `tokenizer@spm` and `tokenizer@bpe`, which compare
+the engine's ids against an independent Python implementation of both encoders
+over a generated vocabulary - covering the merges list, the score ordering and
+the byte fallback (see *Tokenizer* for what that established). The vocabulary
+is a setup fixture, so selecting either entry brings it along:
+
+```bash
+ctest --test-dir build -R tokenizer
+```
+
+By hand that is the fixture and one comparison per scheme; both print a PASS or
+FAIL per text and exit non-zero on a mismatch:
 
 ```bash
 python3 tools/make_tokenizer_gguf.py build
@@ -300,8 +310,6 @@ python3 tools/reference_tokenizer.py --gguf build/tok_spm.gguf \
 python3 tools/reference_tokenizer.py --gguf build/tok_bpe.gguf \
         --json build/tok_bpe.gguf.json --exe build/nita.exe
 ```
-
-Both print a PASS or FAIL per text and exit non-zero on a mismatch.
 
 A bare `ctest --test-dir build` runs everything CTest knows about in about ten
 seconds, which is usually the right default; see *Tests* for the one entry that
@@ -344,9 +352,12 @@ so a test picks up the same sources and flags as the engine.
 | `q35_heads` | `q35_heads_test` | nothing |
 | `q35_probe@<stem>` | `q35_probe` | a checkpoint |
 | `quant_dot@<stem>` | `quant_dot_test` | a checkpoint |
+| `gguf_probe@<stem>` | `tools/gguf_probe.py` | a checkpoint, `nita`, Python 3 |
 | `fork_match@<stem>` | `tools/check_fork_match.py` | a checkpoint and the fork driver |
+| `tokenizer_vocab` | `tools/make_tokenizer_gguf.py` | Python 3 |
+| `tokenizer@spm`, `tokenizer@bpe` | `tools/reference_tokenizer.py` | `nita`, Python 3 |
 
-The three that read a GGUF register once per checkpoint, named after the file
+The four that read a GGUF register once per checkpoint, named after the file
 (`Ternary-Bonsai-2-2B-PTQ1_0`, `Bonsai-27B-Q1_0`), so `-DNITA_TEST_MODELS`
 takes a semicolon-separated list and one configure covers every checkpoint on
 the machine:
@@ -361,7 +372,21 @@ failure, so the same configure works on a machine that holds only one of them,
 and `-DNITA_TEST_MODEL=<one path>` still sets the list to that single entry.
 Because CTest matches names as substrings, `ctest -R fork_match` still selects
 every checkpoint's comparison; `ctest -L checkpoint` selects every entry that
-needs a model.
+needs a model, `-L tokenizer` the three that do not.
+
+`gguf_probe` is the reader's own entry: it parses the header and tensor table
+with Python's `struct` and checks that the declared block geometry of every
+tensor type accounts for the data section, then compares version, tensor count,
+metadata key count and data offset against `nita --inspect`. The layout half is
+an independent model of the file rather than engine code, which is why the
+header half is there too - together they fail on a reader that mis-reads the
+header or on a block-size table that has drifted, and the 27B gets them in under
+1.5 s even when its `fork_match` is deferred.
+
+`tokenizer@spm` and `tokenizer@bpe` run the engine on the synthetic vocabulary
+`tokenizer_vocab` writes into the build directory; that entry is a setup fixture
+so either comparison pulls it in, and a mismatch in the merges, the score
+ordering or the byte fallback exits non-zero.
 
 A full fork comparison costs about a whole forward pass on both sides - four
 seconds on the 2B, but 82 on the 27B - so on a checkpoint over a gigabyte

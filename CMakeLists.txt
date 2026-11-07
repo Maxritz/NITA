@@ -320,6 +320,18 @@ foreach(_model ${NITA_TEST_MODELS})
     set_tests_properties(q35_probe@${_tag} quant_dot@${_tag}
                          PROPERTIES LABELS "checkpoint")
 
+    # The engine's own reader cannot vouch for an offset it read wrongly: a
+    # shifted tensor moves the expected and the actual together. This walks the
+    # header with struct alone and requires every tensor's declared geometry to
+    # account for the data section, so it is the entry that catches a bad read.
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME gguf_probe@${_tag}
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/gguf_probe.py
+                         --engine $<TARGET_FILE:nita> "${_model}")
+        set_tests_properties(gguf_probe@${_tag} PROPERTIES LABELS "checkpoint")
+    endif()
+
     if(_fork_test_driver AND Python3_Interpreter_FOUND)
         if(_model_slow AND NOT NITA_TEST_SLOW)
             message(STATUS
@@ -344,6 +356,34 @@ foreach(_model ${NITA_TEST_MODELS})
 endforeach()
 if(NOT _registered_tags)
     message(STATUS "checkpoint tests: none, set -DNITA_TEST_MODELS=<a.gguf>[;...]")
+endif()
+
+# The tokenizer has no C program behind it, so its cover is the independent
+# encoder pair in tools/reference_tokenizer.py over a generated vocabulary. The
+# packs are a setup fixture, so `ctest -R tokenizer` brings them along even when
+# that is the only entry selected; they are written into the build directory,
+# which is where the manual commands in the README look for them.
+if(Python3_Interpreter_FOUND)
+    add_test(NAME tokenizer_vocab
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_tokenizer_gguf.py
+                     ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(tokenizer_vocab PROPERTIES
+                         FIXTURES_SETUP tokpacks LABELS "tokenizer")
+    foreach(_scheme spm bpe)
+        add_test(NAME tokenizer@${_scheme}
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/reference_tokenizer.py
+                         --gguf ${CMAKE_CURRENT_BINARY_DIR}/tok_${_scheme}.gguf
+                         --json ${CMAKE_CURRENT_BINARY_DIR}/tok_${_scheme}.gguf.json
+                         --exe $<TARGET_FILE:nita>)
+        set_tests_properties(tokenizer@${_scheme} PROPERTIES
+                             FIXTURES_REQUIRED tokpacks
+                             LABELS "tokenizer")
+    endforeach()
+else()
+    message(STATUS
+        "tool checks: no Python 3 interpreter, gguf_probe and tokenizer skipped")
 endif()
 
 message(STATUS "Project: NITA (NC Inference Tool for All)")
