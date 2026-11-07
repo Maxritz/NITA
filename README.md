@@ -863,9 +863,14 @@ override):
 | 2B | 163 ms/token | 47 | 29 | - | 23 |
 | 27B | 1.05 s/token | 0.31 s | 0.18 s | 0.15 s | 0.147 s |
 
-Threads help to sixteen on the 27B, two percent past twelve: the delta rule
-splits sixteen ways, so the last four threads at least have a whole head each to
-show for the SMT clock loss. The qwen35 mixer is still most of a Bonsai token, but its
+The default is the physical core count, and both models agree on it: sixteen
+threads (27B, milliseconds a token: 12 -> 152, 14 -> 149, 16 -> 150, 18 -> 152,
+20 -> 153, 24 -> 153, 32 -> 157; 2B: 8 -> 29.3, 12 -> 24.3, 16 -> 23.5, 20 ->
+24.7, 32 -> 28.2). The SMT siblings cost from there on, which is the old
+assumption holding. Sixteen is also the delta rule's item count, so that phase
+balances exactly at the default. The count is asked of the OS rather than taken
+as half the logical processors, which matters on a CPU without SMT - halving
+would leave half the machine idle there - and `NITA_THREADS` overrides it. The qwen35 mixer is still most of a Bonsai token, but its
 shape has changed twice now. First the three projections moved onto the integer
 kernels and the pool (55%, 19% and 18.5% of a token, all single-threaded,
 became single-digit); then the delta rule, which was 24.8% of the 2B once the

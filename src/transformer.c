@@ -1681,6 +1681,48 @@ void nita_model_close(nita_model_t *m)
     free_model(m);
 }
 
+/* How many threads the pool should start with.
+ *
+ * A projection splits by row into memory-bound work, so the useful ceiling is
+ * the physical core count: the SMT siblings share a core's clocks and add
+ * little to a kernel that is already streaming. Measured on a 16-core/32-thread
+ * part, 27B, milliseconds a token: 12 -> 152, 14 -> 149, 16 -> 150, 18 -> 152,
+ * 20 -> 153, 24 -> 153, 32 -> 157.
+ *
+ * Which is not the same as half the logical processors. A CPU without SMT
+ * reports one logical processor per core, and halving that would leave half the
+ * machine idle; ask for the core count itself and fall back to the old estimate
+ * only if the query fails. */
+#if defined(_WIN32)
+static int default_threads(int logical)
+{
+    DWORD                                     len = 0;
+    int                                       cores = 0;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX  *buf;
+
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0) {
+        buf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)malloc(len);
+        if (buf) {
+            if (GetLogicalProcessorInformationEx(RelationProcessorCore, buf, &len)) {
+                DWORD off = 0;
+
+                while (off < len) {
+                    const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e =
+                        (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)((const char *)buf + off);
+
+                    if (e->Relationship == RelationProcessorCore) cores++;
+                    off += e->Size;
+                }
+            }
+            free(buf);
+        }
+    }
+    if (cores > 0) return cores > logical ? logical : cores;
+    return logical > 1 ? logical / 2 : 1;
+}
+#endif
+
 nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t errlen)
 {
     nita_model_t *m;
@@ -1980,8 +2022,7 @@ nita_model_t *nita_model_open(const gguf_file_t *g, int ctx, char *err, size_t e
         int         nt;
 
         GetSystemInfo(&si);
-        nt = (int)si.dwNumberOfProcessors;
-        if (nt > 1) nt /= 2;          /* SMT siblings do not help a GEMV */
+        nt = default_threads((int)si.dwNumberOfProcessors);
         if (env) { int v = atoi(env); if (v > 0) nt = v; }
         if (nt < 1) nt = 1;
         m->pool = pool_create(nt, m->rowcap);
